@@ -120,7 +120,7 @@ Requires a `.env` file — copy `.env.template` and set `SERVER_PORT` if needed.
 
 1. **Upload** — `POST /upload` validates the body (object shape, at least one dep field, string values only), strips extra fields, saves to `input/<id>.json`, and returns the ID
 2. **Trigger** — `POST /jobs` starts a background job for that ID; responds 202 immediately
-3. **Resolve** — merges `dependencies`, `devDependencies`, and `peerDependencies` (resolving complex peer dep version ranges to concrete versions via `semver`), writes a merged `package.json` to a temp directory, and runs `npm install --ignore-scripts` to materialise the full dependency tree
+3. **Resolve** — merges `dependencies`, `devDependencies`, and `peerDependencies` (resolving complex peer dep version ranges to concrete versions via `semver`), writes a merged `package.json` to a temp directory, runs `npm install --ignore-scripts` to materialise the full dependency tree, then reads `package-lock.json` to add any platform-specific optional packages (e.g. all `@esbuild/*` architecture variants) that npm skipped because they don't match the current host OS/CPU
 4. **Audit** — runs `npm audit --json` against the installed lock file and extracts vulnerability counts and HIGH/CRITICAL package names
 5. **Download** — runs `npm pack <name>@<version>` for every resolved package and collects the `.tgz` files
 6. **Package** — bundles all tarballs together with `metadata.json` into `output/<id>.tgz`

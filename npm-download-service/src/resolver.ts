@@ -99,12 +99,31 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
 
     walkNodeModules(join(tmpDir, "node_modules"));
 
+    const lockfilePath = join(tmpDir, "package-lock.json");
+    if (existsSync(lockfilePath)) {
+      const lockfile = JSON.parse(readFileSync(lockfilePath, "utf-8")) as PackageLock;
+      for (const [modulePath, entry] of Object.entries(lockfile.packages ?? {})) {
+        if (!entry.optional || !entry.version) continue;
+        if (modulePath.split("node_modules/").length > 2) continue;
+        const name = modulePath.replace(/^node_modules\//, "");
+        const key = `${name}@${entry.version}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ name, version: entry.version });
+        }
+      }
+    }
+
     console.log("Running vulnerability audit...");
     const audit = await runAudit(tmpDir, results);
     return { packages: results, audit };
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
+}
+
+interface PackageLock {
+  packages?: Record<string, { version?: string; optional?: boolean }>;
 }
 
 interface NpmAuditJson {
