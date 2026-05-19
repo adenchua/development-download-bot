@@ -31,24 +31,28 @@ export async function downloadAndZip(packages: ResolvedPackage[], id: string, au
   const startedAt = formatISO(new Date());
 
   try {
-    for (const pkg of packages) {
-      const ref = `${pkg.name}@${pkg.version}`;
-      try {
+    const packResults = await Promise.allSettled(
+      packages.map(async (pkg) => {
+        const ref = `${pkg.name}@${pkg.version}`;
         await execFileAsync("npm", ["pack", ref, "--pack-destination", tmpDir], {
           maxBuffer: 1024 * 1024 * 1024,
         });
         const tarball = tarballName(pkg.name, pkg.version);
-        downloaded.push({ name: pkg.name, version: pkg.version, tarball });
         console.log(`  ✓ ${ref}`);
+        return { name: pkg.name, version: pkg.version, tarball };
+      }),
+    );
+
+    for (let index = 0; index < packResults.length; index++) {
+      const result = packResults[index];
+      const pkg = packages[index];
+      if (result.status === "fulfilled") {
+        downloaded.push(result.value);
         succeeded++;
-      } catch (err) {
-        const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
-        console.error(`  ✗ Failed: ${ref} — ${message}`);
-        failedPackages.push({
-          name: pkg.name,
-          version: pkg.version,
-          error: message,
-        });
+      } else {
+        const message = result.reason instanceof Error ? result.reason.message.split("\n")[0] : String(result.reason);
+        console.error(`  ✗ Failed: ${pkg.name}@${pkg.version} — ${message}`);
+        failedPackages.push({ name: pkg.name, version: pkg.version, error: message });
         failed++;
       }
     }

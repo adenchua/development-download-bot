@@ -122,6 +122,6 @@ Requires a `.env` file — copy `.env.template` and set `SERVER_PORT` if needed.
 2. **Trigger** — `POST /jobs` starts a background job for that ID; responds 202 immediately
 3. **Resolve** — merges `dependencies`, `devDependencies`, and `peerDependencies` (resolving complex peer dep version ranges to concrete versions via `semver`), writes a merged `package.json` to a temp directory, runs `npm install --ignore-scripts` to materialise the full dependency tree, then reads `package-lock.json` to add any packages npm skipped installing — platform-specific optional deps that don't match the host OS/CPU (e.g. all `@esbuild/*` architecture variants) and optional peer deps of installed packages (e.g. `@mui/material-pigment-css`)
 4. **Audit** — runs `npm audit --json` against the installed lock file and extracts vulnerability counts and HIGH/CRITICAL package names
-5. **Download** — runs `npm pack <name>@<version>` for every resolved package and collects the `.tgz` files
+5. **Download** — concurrently runs `npm pack <name>@<version>` for all resolved packages via `Promise.allSettled` and collects the `.tgz` files
 6. **Package** — bundles all tarballs together with `metadata.json` into `output/<id>.tgz`
 7. **Cleanup** — removes the temp directory

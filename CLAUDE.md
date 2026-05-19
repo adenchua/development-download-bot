@@ -49,7 +49,7 @@ Volume mounts:
 | `npm-download-service/src/routes/jobs.ts` | `POST /jobs` — fire-and-forget download job |
 | `npm-download-service/src/middleware/errorHandler.ts` | Global Express error handler |
 | `npm-download-service/src/resolver.ts` | Creates a temp dir, merges `dependencies`/`devDependencies`/`peerDependencies`, runs `npm install` to materialise the full dependency tree, walks `node_modules`, reads `package-lock.json` to collect packages npm skipped installing — either platform-specific optional deps that don't match the host OS/CPU (e.g. all `@esbuild/*` variants) or optional peer deps of installed packages (e.g. `@mui/material-pigment-css`) — then runs `npm audit`. Complex peer dep version ranges (`\|\|`, comparisons) are resolved to a concrete latest version via `semver.maxSatisfying()` before install. |
-| `npm-download-service/src/downloader.ts` | Iterates resolved packages, runs `npm pack <name>@<version>` for each, bundles all tarballs + `metadata.json` into a `.tgz` via `archiver` |
+| `npm-download-service/src/downloader.ts` | Concurrently runs `npm pack <name>@<version>` for all resolved packages via `Promise.allSettled`, collects results (succeeded/failed), bundles all tarballs + `metadata.json` into a `.tgz` via `archiver` |
 | `npm-download-service/src/types.ts` | All shared TypeScript interfaces (`PackageJson`, `ResolvedPackage`, `AuditReport`, `PackageMetadata`, etc.) |
 
 ## telegram-bot source map
