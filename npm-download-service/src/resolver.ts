@@ -103,7 +103,7 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
     if (existsSync(lockfilePath)) {
       const lockfile = JSON.parse(readFileSync(lockfilePath, "utf-8")) as PackageLock;
       for (const [modulePath, entry] of Object.entries(lockfile.packages ?? {})) {
-        if (!entry.optional || !entry.version) continue;
+        if ((!entry.optional && !entry.peer) || !entry.version) continue;
         if (modulePath.split("node_modules/").length > 2) continue;
         const name = modulePath.replace(/^node_modules\//, "");
         const key = `${name}@${entry.version}`;
@@ -123,7 +123,7 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
 }
 
 interface PackageLock {
-  packages?: Record<string, { version?: string; optional?: boolean }>;
+  packages?: Record<string, { version?: string; optional?: boolean; peer?: boolean }>;
 }
 
 interface NpmAuditJson {
