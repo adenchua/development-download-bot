@@ -54,6 +54,14 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
     const seen = new Set<string>();
     const results: ResolvedPackage[] = [];
 
+    function addIfNew(name: string, version: string): boolean {
+      const key = `${name}@${version}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      results.push({ name, version });
+      return true;
+    }
+
     function walkNodeModules(nodeModulesDir: string): void {
       if (!existsSync(nodeModulesDir)) return;
 
@@ -80,10 +88,8 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
       if (existsSync(pkgJsonPath)) {
         try {
           const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
-          const key = `${pkg.name}@${pkg.version}`;
-          if (pkg.name && pkg.version && !seen.has(key)) {
-            seen.add(key);
-            results.push({ name: pkg.name, version: pkg.version });
+          if (pkg.name && pkg.version) {
+            addIfNew(pkg.name, pkg.version);
           }
         } catch {
           // skip malformed package.json
@@ -103,13 +109,76 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
     if (existsSync(lockfilePath)) {
       const lockfile = JSON.parse(readFileSync(lockfilePath, "utf-8")) as PackageLock;
       for (const [modulePath, entry] of Object.entries(lockfile.packages ?? {})) {
-        if ((!entry.optional && !entry.peer) || !entry.version) continue;
-        if (modulePath.split("node_modules/").length > 2) continue;
+        if (!entry.optional || !entry.version) continue;
+
         const name = modulePath.replace(/^node_modules\//, "");
-        const key = `${name}@${entry.version}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          results.push({ name, version: entry.version });
+        addIfNew(name, entry.version);
+      }
+    }
+
+    // npm v11 does not write optional peer deps (peerDependenciesMeta) to package-lock.json,
+    // so scan each installed package's package.json directly.
+    const optionalPeerCandidates = new Map<string, string>();
+    for (const pkg of [...results]) {
+      const pkgDir = join(tmpDir, "node_modules", ...pkg.name.split("/"));
+      const pkgJsonPath = join(pkgDir, "package.json");
+      if (!existsSync(pkgJsonPath)) continue;
+      try {
+        const pkgData = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
+        const peerDeps: Record<string, string> = pkgData.peerDependencies ?? {};
+        const peerMeta: Record<string, { optional?: boolean }> = pkgData.peerDependenciesMeta ?? {};
+        for (const [peerName, peerRange] of Object.entries(peerDeps)) {
+          if (peerMeta[peerName]?.optional && !optionalPeerCandidates.has(peerName)) {
+            optionalPeerCandidates.set(peerName, peerRange);
+          }
+        }
+      } catch {
+        // skip malformed package.json
+      }
+    }
+
+    const passBAdded: ResolvedPackage[] = [];
+    if (optionalPeerCandidates.size > 0) {
+      console.log(`Resolving ${optionalPeerCandidates.size} optional peer dep(s)...`);
+      for (const [peerName, peerRange] of optionalPeerCandidates) {
+        const resolvedVersion = await resolveVersionRange(peerName, peerRange);
+        if (resolvedVersion) {
+          if (addIfNew(peerName, resolvedVersion)) {
+            passBAdded.push({ name: peerName, version: resolvedVersion });
+            console.log(`  Added optional peer dep: ${peerName}@${resolvedVersion}`);
+          }
+        }
+      }
+    }
+
+    // Pass (c): fetch optionalDependencies of packages added by pass (b).
+    // Not recursive — only processes pass (b) outputs. Catches platform-specific
+    // packages (e.g. @esbuild/*) whose parent (esbuild) was never installed by npm.
+    if (passBAdded.length > 0) {
+      console.log(`Resolving optional deps of ${passBAdded.length} optional peer dep(s)...`);
+      for (const pkg of passBAdded) {
+        try {
+          const { stdout } = await execFileAsync(
+            "npm",
+            ["view", `${pkg.name}@${pkg.version}`, "optionalDependencies", "--json"],
+            { maxBuffer: 10 * 1024 * 1024 },
+          );
+          if (!stdout.trim()) continue;
+          const optDeps = JSON.parse(stdout) as Record<string, string>;
+          for (const [depName, depVersion] of Object.entries(optDeps)) {
+            if (semver.valid(depVersion)) {
+              if (addIfNew(depName, depVersion)) {
+                console.log(`  Added optional dep of ${pkg.name}: ${depName}@${depVersion}`);
+              }
+            } else {
+              const resolved = await resolveVersionRange(depName, depVersion);
+              if (resolved && addIfNew(depName, resolved)) {
+                console.log(`  Added optional dep of ${pkg.name}: ${depName}@${resolved}`);
+              }
+            }
+          }
+        } catch {
+          // package has no optionalDependencies or npm view failed
         }
       }
     }
@@ -123,7 +192,7 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
 }
 
 interface PackageLock {
-  packages?: Record<string, { version?: string; optional?: boolean; peer?: boolean }>;
+  packages?: Record<string, { version?: string; optional?: boolean }>;
 }
 
 interface NpmAuditJson {

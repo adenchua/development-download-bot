@@ -6,7 +6,7 @@ A system for downloading npm packages offline and managing user access via Teleg
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| `npm-download-service` | 3000 | HTTP API — resolves transitive npm dependencies and packages them as `.zip` archives |
+| `npm-download-service` | 3000 | HTTP API — resolves transitive npm dependencies and packages them as `.tgz` archives |
 | `telegram-bot` | — | Telegram bot — submit download requests and manage user access |
 | `mongodb` | 27017 (internal) | Persistent storage for registered users, subscribers, and job history |
 | `mongo-express` | 8081 | Web UI for inspecting the database |
