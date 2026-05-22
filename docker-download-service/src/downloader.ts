@@ -48,7 +48,22 @@ async function runTrivyScan(imageRef: string): Promise<AuditSeverityCounts> {
   const counts: AuditSeverityCounts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
   let stdout = "";
   try {
-    const result = await execFileAsync("trivy", ["image", "--format", "json", "--quiet", imageRef]);
+    const result = await execFileAsync("docker", [
+      "run",
+      "--rm",
+      "-v",
+      "/var/run/docker.sock:/var/run/docker.sock",
+      "-v",
+      "trivy-cache:/root/.cache/trivy",
+      "aquasec/trivy:latest",
+      "image",
+      "--format",
+      "json",
+      "--quiet",
+      "--cache-ttl",
+      "1h",
+      imageRef,
+    ]);
     stdout = result.stdout;
   } catch (err: unknown) {
     // trivy exits non-zero when vulnerabilities are found — read stdout anyway

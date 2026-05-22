@@ -100,7 +100,7 @@ docker load -i nginx-latest-a5de3e7a.tar
 }
 ```
 
-Vulnerability counts come from [Trivy](https://github.com/aquasecurity/trivy), which scans each image after pulling.
+Vulnerability counts come from [Trivy](https://github.com/aquasecurity/trivy), run as an ephemeral `aquasec/trivy:latest` container at scan time. The vulnerability database is cached in a named Docker volume (`trivy-cache`) and refreshed automatically when the cached copy is older than 1 hour.
 
 ## Local development
 
@@ -111,7 +111,7 @@ npm start       # starts on SERVER_PORT (default 3000)
 
 Requires a `.env` file — copy `.env.template` and set `SERVER_PORT` if needed.
 
-**Important:** `docker pull`, `docker save`, and `docker inspect` run inside the process, so a Docker daemon must be accessible. When running locally, the host Docker daemon is used automatically. When running inside a container, `/var/run/docker.sock` must be mounted (see `docker-compose.yml`).
+**Important:** `docker pull`, `docker save`, `docker inspect`, and the Trivy scan (run as an ephemeral `aquasec/trivy:latest` container) all require a Docker daemon to be accessible. When running locally, the host Docker daemon is used automatically. When running inside a container, `/var/run/docker.sock` must be mounted (see `docker-compose.yml`).
 
 ## Scripts
 
@@ -129,6 +129,6 @@ Requires a `.env` file — copy `.env.template` and set `SERVER_PORT` if needed.
 4. **Pull** — `docker pull --platform <platform> <image>:<tag>` is run concurrently for all images via `Promise.allSettled` (partial success — failed images are recorded but don't abort the job)
 5. **Digest** — for `latest`-tagged images, `docker inspect` retrieves the repo digest so the tarball filename encodes which specific version was pulled
 6. **Save** — `docker save <image>:<tag> -o <filename>.tar` writes each image to a `.tar` file
-7. **Scan** — `trivy image --format json <image>:<tag>` scans each pulled image for vulnerabilities; severity counts are aggregated into `metadata.json`
+7. **Scan** — `docker run --rm aquasec/trivy:latest image --format json --cache-ttl 1h <image>:<tag>` scans each pulled image for vulnerabilities via an ephemeral Trivy container; severity counts are aggregated into `metadata.json`. The vulnerability database is cached in the `trivy-cache` named volume (refreshed when older than 1 hour)
 8. **Cleanup** — `docker rmi <image>:<tag>` removes the pulled image from the Docker daemon to avoid filling host storage
 9. **Package** — all `.tar` files and `metadata.json` are bundled into `output/<id>.tgz` via `archiver`, then the individual `.tar` files are deleted
