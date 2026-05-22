@@ -11,6 +11,13 @@ import { ResolvedImage, AuditSeverityCounts, DockerMetadata, ImageMetadata } fro
 const execFileAsync = promisify(execFile);
 
 const TRIVY_IMAGE = `aquasec/trivy:${process.env.TRIVY_VERSION ?? "latest"}`;
+const COPA_IMAGE = `ghcr.io/project-copacetic/copacetic:${process.env.COPA_VERSION ?? "latest"}`;
+
+// Named docker volume shared between the trivy pre-scan and copa: trivy writes
+// the JSON report into it via --output, copa reads it via -r. Our service
+// itself never touches the volume — the file only crosses container boundaries.
+const COPA_REPORT_VOLUME = "copa-reports";
+const COPA_REPORT_MOUNT = "/reports";
 
 // Naming: "latest" tag gets a short digest suffix; all other tags use tag only.
 // Slashes in image names are replaced with dashes (e.g. bitnami/nginx → bitnami-nginx).
@@ -41,10 +48,9 @@ async function getResolvedTag(imageRef: string): Promise<string | undefined> {
 
 // Returns the first 8 hex chars of the sha256 digest for an image, used to
 // make "latest"-tagged filenames unique across pulls at different points in time.
-async function getShortDigest(image: ResolvedImage): Promise<string | undefined> {
+async function getShortDigest(imageRef: string): Promise<string | undefined> {
   try {
-    const ref = `${image.name}:${image.tag}`;
-    const { stdout } = await execFileAsync("docker", ["inspect", ref, "--format", "{{index .RepoDigests 0}}"]);
+    const { stdout } = await execFileAsync("docker", ["inspect", imageRef, "--format", "{{index .RepoDigests 0}}"]);
     const repoDigest = stdout.trim(); // e.g. "nginx@sha256:a5de3e7a..."
     const sha256Match = /sha256:([0-9a-f]+)/.exec(repoDigest);
     if (sha256Match) return sha256Match[1].slice(0, 8);
@@ -62,26 +68,34 @@ interface TrivyResult {
   }>;
 }
 
-// Runs trivy against a pulled image and aggregates severity counts.
-async function runTrivyScan(imageRef: string): Promise<AuditSeverityCounts> {
+// Runs trivy against a pulled image.
+// When reportFilename is given, the JSON report is written into the shared
+// copa-reports volume (so copa can consume it) and stdout is empty — counts
+// are returned as zero. When reportFilename is unset, trivy streams JSON to
+// stdout and counts are parsed for use in metadata.json.
+async function runTrivyScan(imageRef: string, reportFilename?: string): Promise<AuditSeverityCounts> {
   const counts: AuditSeverityCounts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
+
+  const dockerArgs: string[] = [
+    "run",
+    "--rm",
+    "-v",
+    "/var/run/docker.sock:/var/run/docker.sock",
+    "-v",
+    "trivy-cache:/root/.cache/trivy",
+  ];
+  if (reportFilename) {
+    dockerArgs.push("-v", `${COPA_REPORT_VOLUME}:${COPA_REPORT_MOUNT}`);
+  }
+  dockerArgs.push(TRIVY_IMAGE, "image", "--format", "json", "--quiet", "--cache-ttl", "1h");
+  if (reportFilename) {
+    dockerArgs.push("--output", `${COPA_REPORT_MOUNT}/${reportFilename}`);
+  }
+  dockerArgs.push(imageRef);
+
   let stdout = "";
   try {
-    const result = await execFileAsync("docker", [
-      "run",
-      "--rm",
-      "-v",
-      "/var/run/docker.sock:/var/run/docker.sock",
-      "-v",
-      "trivy-cache:/root/.cache/trivy",
-      TRIVY_IMAGE,      "image",
-      "--format",
-      "json",
-      "--quiet",
-      "--cache-ttl",
-      "1h",
-      imageRef,
-    ]);
+    const result = await execFileAsync("docker", dockerArgs);
     stdout = result.stdout;
   } catch (err: unknown) {
     // trivy exits non-zero when vulnerabilities are found — read stdout anyway
@@ -92,6 +106,9 @@ async function runTrivyScan(imageRef: string): Promise<AuditSeverityCounts> {
       return counts;
     }
   }
+
+  // Pre-scan writes to the shared volume; the report is consumed by copa, not us.
+  if (reportFilename) return counts;
 
   try {
     const report = JSON.parse(stdout) as TrivyResult;
@@ -109,6 +126,61 @@ async function runTrivyScan(imageRef: string): Promise<AuditSeverityCounts> {
   return counts;
 }
 
+interface HardenResult {
+  hardened: boolean;
+  patchedTag?: string;
+  patchedPackageCount?: number;
+  hardenReason?: string;
+}
+
+// Best-effort parse of copa stdout to extract a count of patched packages.
+function parseCopaPatchedCount(text: string): number | undefined {
+  const match = /(?:patched|updated)\s+(\d+)/i.exec(text);
+  return match ? parseInt(match[1], 10) : undefined;
+}
+
+// Runs copa against an image using a pre-generated trivy JSON report.
+// Three outcomes:
+//   - success → returns hardened:true with patchedTag set
+//   - no patchable CVEs (copa errors with a recognisable message) → hardened:true, no patchedTag
+//   - any other failure → hardened:false with reason set
+async function runCopaPatch(imageRef: string, reportFilename: string, patchedTag: string): Promise<HardenResult> {
+  try {
+    const { stdout } = await execFileAsync("docker", [
+      "run",
+      "--rm",
+      "-v",
+      "/var/run/docker.sock:/var/run/docker.sock",
+      "-v",
+      `${COPA_REPORT_VOLUME}:${COPA_REPORT_MOUNT}`,
+      COPA_IMAGE,
+      "patch",
+      "-i",
+      imageRef,
+      "-r",
+      `${COPA_REPORT_MOUNT}/${reportFilename}`,
+      "-t",
+      patchedTag,
+    ]);
+    return {
+      hardened: true,
+      patchedTag,
+      patchedPackageCount: parseCopaPatchedCount(stdout),
+    };
+  } catch (err: unknown) {
+    const stderr =
+      err && typeof err === "object" && "stderr" in err ? String((err as { stderr: string }).stderr) : String(err);
+
+    // Copa exits non-zero when the report has no patchable vulnerabilities.
+    if (/no.{0,30}(patches|vulnerab|updat)/i.test(stderr)) {
+      return { hardened: true, patchedPackageCount: 0 };
+    }
+
+    const firstLine = stderr.split("\n").find((line) => line.trim().length > 0) ?? "copa error";
+    return { hardened: false, hardenReason: firstLine.trim().slice(0, 200) };
+  }
+}
+
 interface PullResult {
   status: "fulfilled";
   metadata: ImageMetadata;
@@ -123,51 +195,74 @@ interface PullFailure {
   error: string;
 }
 
-async function pullAndSave(image: ResolvedImage, outputDir: string): Promise<PullResult> {
-  const ref = `${image.name}:${image.tag}`;
+async function pullAndSave(image: ResolvedImage, outputDir: string, jobId: string): Promise<PullResult> {
+  const originalRef = `${image.name}:${image.tag}`;
+  await execFileAsync("docker", ["pull", "--platform", image.platform, originalRef]);
 
-  await execFileAsync("docker", ["pull", "--platform", image.platform, ref]);
-
-  // For latest-tagged images, try to resolve to the concrete version via OCI label.
+  // For "latest"-tagged images, try to resolve to the concrete version via the OCI label.
+  // workingRef holds the canonical ref we'll save under (resolved version if available, else original).
+  let workingRef = originalRef;
+  let resolvedTag: string | undefined;
   if (image.tag === "latest") {
-    const resolvedTag = await getResolvedTag(ref);
+    resolvedTag = await getResolvedTag(originalRef);
     if (resolvedTag) {
-      const resolvedRef = `${image.name}:${resolvedTag}`;
-      await execFileAsync("docker", ["tag", ref, resolvedRef]);
-      const filename = tarballName(image.name, resolvedTag);
-      const tarPath = join(outputDir, filename);
-      await execFileAsync("docker", ["save", resolvedRef, "-o", tarPath]);
-      const audit = await runTrivyScan(resolvedRef);
-      await execFileAsync("docker", ["rmi", ref, resolvedRef]).catch(() => {});
-      return {
-        status: "fulfilled",
-        metadata: { name: image.name, version: resolvedTag, tarball: filename },
-        tarPath,
-        audit,
-      };
+      workingRef = `${image.name}:${resolvedTag}`;
+      await execFileAsync("docker", ["tag", originalRef, workingRef]);
     }
-    // Label absent — fall through to existing latest+digest behaviour
   }
 
+  // Capture the source digest before copa patches the image bytes. Used only
+  // for filename disambiguation when "latest" has no OCI version label.
   let shortDigest: string | undefined;
-  if (image.tag === "latest") {
-    shortDigest = await getShortDigest(image);
+  if (image.tag === "latest" && !resolvedTag) {
+    shortDigest = await getShortDigest(workingRef);
   }
 
-  const filename = tarballName(image.name, image.tag, shortDigest);
+  // Harden via copa (best-effort). Windows images are skipped upfront — copa is linux-only.
+  const safeName = image.name.replace(/\//g, "-");
+  const reportFilename = `${jobId}-${safeName}-${image.tag}.json`;
+  const copaTag = `${image.name}:copa-${jobId}`;
+
+  let hardenResult: HardenResult;
+  if (image.platform.startsWith("windows/")) {
+    hardenResult = { hardened: false, hardenReason: "windows images not supported by copa" };
+  } else {
+    await runTrivyScan(workingRef, reportFilename);
+    hardenResult = await runCopaPatch(workingRef, reportFilename, copaTag);
+    if (hardenResult.patchedTag) {
+      // Re-tag the patched image as workingRef so docker save / docker load preserve the user-facing tag.
+      await execFileAsync("docker", ["tag", hardenResult.patchedTag, workingRef]);
+    }
+  }
+
+  const finalTag = resolvedTag ?? image.tag;
+  const filename = tarballName(image.name, finalTag, shortDigest);
   const tarPath = join(outputDir, filename);
 
-  await execFileAsync("docker", ["save", ref, "-o", tarPath]);
+  await execFileAsync("docker", ["save", workingRef, "-o", tarPath]);
 
-  const audit = await runTrivyScan(ref);
+  // Post-patch scan — this is the one recorded in metadata.json.audit.
+  const audit = await runTrivyScan(workingRef);
 
-  // Clean up pulled image to avoid filling the host's docker storage
-  await execFileAsync("docker", ["rmi", ref]).catch(() => {});
+  // Clean up all tags we created or pulled.
+  const refsToRemove: string[] = [originalRef];
+  if (workingRef !== originalRef) refsToRemove.push(workingRef);
+  if (hardenResult.patchedTag && hardenResult.patchedTag !== workingRef) {
+    refsToRemove.push(hardenResult.patchedTag);
+  }
+  await execFileAsync("docker", ["rmi", ...refsToRemove]).catch(() => {});
 
-  const digest = shortDigest ? `sha256:${shortDigest}` : undefined;
   return {
     status: "fulfilled",
-    metadata: { name: image.name, version: image.tag, tarball: filename, digest },
+    metadata: {
+      name: image.name,
+      version: finalTag,
+      tarball: filename,
+      digest: shortDigest ? `sha256:${shortDigest}` : undefined,
+      hardened: hardenResult.hardened,
+      patchedPackageCount: hardenResult.patchedPackageCount,
+      hardenReason: hardenResult.hardenReason,
+    },
     tarPath,
     audit,
   };
@@ -191,7 +286,7 @@ export async function downloadAndZip(images: ResolvedImage[], jobId: string): Pr
   const TEMP_DIR = resolve("output");
   const startedAt = formatISO(new Date());
 
-  const results = await Promise.allSettled(images.map((image) => pullAndSave(image, TEMP_DIR)));
+  const results = await Promise.allSettled(images.map((image) => pullAndSave(image, TEMP_DIR, jobId)));
 
   const succeeded: PullResult[] = [];
   const failed: PullFailure[] = [];

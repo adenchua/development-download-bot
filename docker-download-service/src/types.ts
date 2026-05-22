@@ -22,6 +22,9 @@ export interface ImageMetadata {
   version: string;
   tarball: string;
   digest?: string;
+  hardened: boolean;
+  patchedPackageCount?: number;
+  hardenReason?: string;
 }
 
 export interface DockerMetadata {
