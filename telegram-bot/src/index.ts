@@ -8,8 +8,16 @@ import { registerCommand } from "./commands/register";
 import { approveClientScene, APPROVE_SCENE_ID } from "./commands/approveClient";
 import { notifyClientScene, NOTIFY_CLIENT_SCENE_ID } from "./commands/notifyClient";
 import { subscribeScene, unsubscribeScene, SUBSCRIBE_SCENE_ID, UNSUBSCRIBE_SCENE_ID } from "./commands/subscribe";
-import { requestScene, REQUEST_SCENE_ID, processPackageJsonRequest, processNpmUrlRequest } from "./commands/request";
-import { BotContext, MAX_PACKAGE_JSON_BYTES, ALLOWED_MIME_TYPES, parseAndValidatePackageJson, parseNpmUrl } from "./commands/helpers";
+import {
+  requestScene,
+  REQUEST_SCENE_ID,
+  processPackageJsonRequest,
+  processNpmUrlRequest,
+  processDockerJsonRequest,
+} from "./commands/request";
+import { BotContext, MAX_PACKAGE_JSON_BYTES, ALLOWED_MIME_TYPES } from "./commands/helpers";
+import { parseAndValidatePackageJson, parseNpmUrl } from "./commands/parsers/npm";
+import { parseDockerJson, parseDockerHubUrl } from "./commands/parsers/docker";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -39,7 +47,7 @@ bot.help((ctx) =>
     "Available commands:\n" +
       "/start — Welcome message\n" +
       "/register — Register your account\n" +
-      "/request — Submit a package.json to download npm packages\n" +
+      "/request — Submit a package.json or docker JSON to download packages\n" +
       "/cancel — Cancel the current conversation\n" +
       "/help — Show this message",
   ),
@@ -71,7 +79,8 @@ bot.on("message", async (ctx) => {
   const isDocument = "document" in msg;
   const isJsonText = "text" in msg && msg.text.trimStart().startsWith("{");
   const npmUrlParsed = "text" in msg ? parseNpmUrl(msg.text) : null;
-  if (!isDocument && !isJsonText && !npmUrlParsed) return;
+  const dockerUrlParsed = "text" in msg && !npmUrlParsed ? parseDockerHubUrl(msg.text) : null;
+  if (!isDocument && !isJsonText && !npmUrlParsed && !dockerUrlParsed) return;
 
   const client = await getClientByTelegramId(ctx.from!.id);
   if (!client) {
@@ -88,7 +97,12 @@ bot.on("message", async (ctx) => {
     return;
   }
 
-  let pkg: Record<string, unknown> | null = null;
+  if (dockerUrlParsed) {
+    await processDockerJsonRequest(ctx, dockerUrlParsed);
+    return;
+  }
+
+  let rawText: string | null = null;
 
   if (isDocument) {
     const { file_size, mime_type, file_name } = msg.document;
@@ -100,14 +114,24 @@ bot.on("message", async (ctx) => {
     const res = await fetch(fileLink.href);
     const text = await res.text();
     if (text.length > MAX_PACKAGE_JSON_BYTES) return;
-    pkg = parseAndValidatePackageJson(text);
+    rawText = text;
   } else if (isJsonText) {
-    pkg = parseAndValidatePackageJson(msg.text);
+    rawText = msg.text;
   }
 
-  if (!pkg) return;
+  if (!rawText) return;
 
-  await processPackageJsonRequest(ctx, pkg);
+  // npm takes priority: dep fields beat images key
+  const pkg = parseAndValidatePackageJson(rawText);
+  if (pkg) {
+    await processPackageJsonRequest(ctx, pkg);
+    return;
+  }
+
+  const dockerPayload = parseDockerJson(rawText);
+  if (dockerPayload) {
+    await processDockerJsonRequest(ctx, dockerPayload);
+  }
 });
 
 async function main() {
@@ -116,6 +140,9 @@ async function main() {
   }
   if (!process.env.NPM_DOWNLOAD_SERVICE_URL) {
     throw new Error("NPM_DOWNLOAD_SERVICE_URL is not set");
+  }
+  if (!process.env.DOCKER_DOWNLOAD_SERVICE_URL) {
+    throw new Error("DOCKER_DOWNLOAD_SERVICE_URL is not set");
   }
   await connectDb();
   await ensureClientIndexes();

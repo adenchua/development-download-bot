@@ -17,6 +17,23 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  docker-download-service:
+    build: ./docker-download-service
+    env_file: ./docker-download-service/.env
+    environment:
+      TZ: Asia/Singapore
+    volumes:
+      - ./docker-download-service/input:/app/input
+      - ./docker-download-service/output:/app/output
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
   mongodb:
     image: mongo:8
     env_file: ./database/.env
@@ -40,9 +57,12 @@ services:
         condition: service_healthy
       npm-download-service:
         condition: service_healthy
+      docker-download-service:
+        condition: service_healthy
     environment:
       TZ: Asia/Singapore
       NPM_DOWNLOAD_SERVICE_URL: http://npm-download-service:3000
+      DOCKER_DOWNLOAD_SERVICE_URL: http://docker-download-service:3000
     restart: unless-stopped
 
   mongo-express:

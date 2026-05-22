@@ -5,12 +5,15 @@
 | Directory | Role |
 |-----------|------|
 | `npm-download-service/` | HTTP service that resolves and bundles npm dependencies as offline `.tgz` archives |
+| `docker-download-service/` | HTTP service that pulls Docker images and bundles them as offline `.tgz` archives |
 | `telegram-bot/` | Telegram bot for submitting download requests and managing user access |
 | `database/` | MongoDB schema definitions and init scripts |
 
+> **Future:** `python-download-service/` — will follow the same HTTP contract (`POST /upload` → `{ id }`, `POST /jobs`) and service structure as the existing services. The bot already has parser stubs in `telegram-bot/src/commands/parsers/` for npm and docker; a `python.ts` parser will be added when that service is built.
+
 ## Development commands
 
-Both `npm-download-service` and `telegram-bot` share the same scripts (run from the relevant package directory):
+All three services (`npm-download-service`, `docker-download-service`, `telegram-bot`) share the same scripts (run from the relevant package directory):
 
 | Command | Description |
 |---------|-------------|
@@ -21,22 +24,25 @@ Both `npm-download-service` and `telegram-bot` share the same scripts (run from 
 
 ## Docker Compose
 
-Four services with explicit health-check dependencies:
+Five services with explicit health-check dependencies:
 
 ```
-npm-download-service  (health: GET /health)
-mongodb               (health: mongosh ping)   ← initialised by database/init/01-init.js on first run
-  └── telegram-bot    (depends on mongodb + npm-download-service, both healthy)
-  └── mongo-express   (depends on mongodb, healthy)
+npm-download-service    (health: GET /health)
+docker-download-service (health: GET /health)
+mongodb                 (health: mongosh ping)   ← initialised by database/init/01-init.js on first run
+  └── telegram-bot      (depends on mongodb + npm-download-service + docker-download-service, all healthy)
+  └── mongo-express     (depends on mongodb, healthy)
 ```
 
 Volume mounts:
 - `npm-download-service/input/` and `output/` → `/app/input` and `/app/output`
+- `docker-download-service/input/` and `output/` → `/app/input` and `/app/output`
+- `/var/run/docker.sock` → `/var/run/docker.sock` (docker-download-service needs host Docker daemon access)
 - `database/data/` → `/data/db` (MongoDB persistence)
 - `database/init/` → `/docker-entrypoint-initdb.d/` (runs once on init)
 - `database/schemas/` → `/schemas/` (read by init script)
 
-`NPM_DOWNLOAD_SERVICE_URL` is injected directly via `environment:` in the compose file so the telegram-bot always resolves to `http://npm-download-service:3000` inside Docker, regardless of what is in `telegram-bot/.env`.
+`NPM_DOWNLOAD_SERVICE_URL` and `DOCKER_DOWNLOAD_SERVICE_URL` are injected directly via `environment:` in the compose file so the telegram-bot always resolves to the correct internal hostnames, regardless of what is in `telegram-bot/.env`.
 
 ## npm-download-service source map
 
@@ -56,16 +62,32 @@ Volume mounts:
 
 | File | Role |
 |------|------|
-| `telegram-bot/src/index.ts` | Bot entry point; registers middleware (session → cancel → stage), all command handlers, `bot.on('message')` passive package.json handler, startup DB index creation and env var validation |
+| `telegram-bot/src/index.ts` | Bot entry point; registers middleware (session → cancel → stage), all command handlers, `bot.on('message')` passive handler (detects npm/docker inputs silently), startup DB index creation and env var validation (`NPM_DOWNLOAD_SERVICE_URL` + `DOCKER_DOWNLOAD_SERVICE_URL` both required) |
 | `telegram-bot/src/db/index.ts` | MongoDB connection management (`connectDb`, `getDb`, `closeDb`) |
 | `telegram-bot/src/db/clients.ts` | `clients` collection: `registerClient`, `approveClient`, `grantAdmin`, `getClientByTelegramId`, `getClientById`, `getPendingClients`, `ensureIndexes` — `Client` interface includes optional `isAdmin` field |
 | `telegram-bot/src/db/subscribers.ts` | `subscribers` collection: `addSubscriber`, `removeSubscriber`, `getAllSubscribers`, `ensureIndexes` |
-| `telegram-bot/src/db/jobs.ts` | `jobs` collection: `addJob`, `getPendingJobs`, `updateJobStatus`, `getJobByJobId`, `ensureIndexes` — records each download request with `clientId`, `jobId`, `startedAt`; optional `status` (`"success"` \| `"failed"`), `completedAt`, and `completedBy` (Telegram ID of the admin who resolved it) set by `/notify_client`; `getPendingJobs(limit, maxAgeDays?)` accepts an optional `maxAgeDays` — when provided, adds `startedAt: { $gte: now - maxAgeDays * 24h }` to the query |
-| `telegram-bot/src/commands/helpers.ts` | Shared helpers: `BotContext`, `getText`, `requireText`, `checkSecret`, `parseAndValidatePackageJson`, `parseNpmUrl`, `MAX_PACKAGE_JSON_BYTES`, `ALLOWED_MIME_TYPES`, `CALLBACK_PREFIXES`, `formatClientName`, `requireCallbackData`, `SECRET_PROMPT_STEP` — `SECRET_PROMPT_STEP` checks `isAdmin` in DB and bypasses the prompt for known admins; `checkSecret` persists `isAdmin` via `grantAdmin` and auto-subscribes via `addSubscriber` on first successful validation |
+| `telegram-bot/src/db/jobs.ts` | `jobs` collection: `addJob`, `getPendingJobs`, `updateJobStatus`, `getJobByJobId`, `ensureIndexes` — records each download request with `clientId`, `jobId`, `startedAt`, `serviceType` (`"npm"` \| `"docker"`, optional for backwards compat with pre-existing docs); optional `status` (`"success"` \| `"failed"`), `completedAt`, and `completedBy` (Telegram ID of the admin who resolved it) set by `/notify_client`; `getPendingJobs(limit, maxAgeDays?)` accepts an optional `maxAgeDays` — when provided, adds `startedAt: { $gte: now - maxAgeDays * 24h }` to the query |
+| `telegram-bot/src/commands/helpers.ts` | Shared helpers: `BotContext`, `getText`, `requireText`, `checkSecret`, `MAX_PACKAGE_JSON_BYTES`, `ALLOWED_MIME_TYPES`, `CALLBACK_PREFIXES`, `formatClientName`, `requireCallbackData`, `SECRET_PROMPT_STEP` — `SECRET_PROMPT_STEP` checks `isAdmin` in DB and bypasses the prompt for known admins; `checkSecret` persists `isAdmin` via `grantAdmin` and auto-subscribes via `addSubscriber` on first successful validation. Service-specific parsers have moved to `commands/parsers/`. |
+| `telegram-bot/src/commands/parsers/npm.ts` | npm-specific parsing: `parseAndValidatePackageJson(text)` and `parseNpmUrl(text)` (moved from `helpers.ts`). `parseAndValidatePackageJson` validates a JSON string and returns a field-allowlisted object or `null`. `parseNpmUrl` matches an npmjs.com URL and returns `{ name, version }` with shell-metacharacter validation. |
+| `telegram-bot/src/commands/parsers/docker.ts` | Docker-specific parsing: `parseDockerJson(text)` validates a `{ images, platform? }` JSON payload; `parseDockerHubUrl(text)` matches `hub.docker.com/_/<image>` (official) and `hub.docker.com/r/<org>/<name>` (user/org) URLs; both return `{ images, platform }` or `null`. `validateDockerImageName` is the shared image-name validator used by both. Tag defaults to `latest` when not present in the URL. |
 | `telegram-bot/src/commands/approveClient.ts` | 4-step wizard: (secret prompt or admin bypass) → validate → show inline keyboard of pending clients → confirm with Yes/No buttons → approve |
-| `telegram-bot/src/commands/notifyClient.ts` | 4-step wizard: (secret prompt or admin bypass) → validate → show inline keyboard of last 5 pending jobs from the past 7 days (no `status` field) → select job → Success/Failed buttons → update `status`/`completedAt`/`completedBy` in DB → send outcome message to original requestor |
+| `telegram-bot/src/commands/notifyClient.ts` | 4-step wizard: (secret prompt or admin bypass) → validate → show inline keyboard of last 5 pending jobs from the past 7 days (no `status` field) → select job → Success/Failed buttons → update `status`/`completedAt`/`completedBy` in DB → send outcome message to original requestor. Job labels are prefixed with `[npm]` or `[docker]`; legacy jobs without `serviceType` fall back to `[npm]`. |
 | `telegram-bot/src/commands/subscribe.ts` | Two 2-step wizards: `subscribeScene` and `unsubscribeScene` — both use the same admin-bypass step 0 |
-| `telegram-bot/src/commands/request.ts` | 2-step wizard: prompt for `package.json` or npmjs.com URL → validate → `POST /upload` → record job in `jobs` collection → `POST /jobs` → reply job ID → notify all subscribers. Exports `processPackageJsonRequest(ctx, pkg)` and `processNpmUrlRequest(ctx, name, version)` — both shared by the wizard and the passive message handler in `index.ts` |
+| `telegram-bot/src/commands/request.ts` | Multi-service dispatcher: 2-step wizard that auto-detects service type from input and routes to the correct service. Detection order: (1) npmjs.com URL → npm, (2) hub.docker.com URL → docker, (3) JSON with dep fields → npm, (4) JSON with `images` key → docker. Inner `submitJob(ctx, serviceUrl, serviceType, payload)` handles upload → job record → job start → subscriber notification for all service types. Exports `processPackageJsonRequest`, `processNpmUrlRequest`, `processDockerJsonRequest`, and `resolveRawText` — all shared with the passive handler in `index.ts`. |
+
+## docker-download-service source map
+
+| File | Role |
+|------|------|
+| `docker-download-service/src/index.ts` | HTTP server entry point; creates `input/` and `output/` dirs, starts Express on `SERVER_PORT` |
+| `docker-download-service/src/app.ts` | Express app factory; mounts `filesRouter` and `jobsRouter`; serves Swagger UI at `GET /docs`; registers global `errorHandler` |
+| `docker-download-service/src/swagger.ts` | OpenAPI 3.1.0 document exported as `swaggerDocument` |
+| `docker-download-service/src/routes/files.ts` | `POST /upload` — accepts `{ images, platform? }`, fills platform default, saves to `input/<id>.json`; `GET /files` (with `?showToday` filter) |
+| `docker-download-service/src/routes/jobs.ts` | `POST /jobs` — fire-and-forget download job; reads saved payload, calls `resolveImages` then `downloadAndZip` |
+| `docker-download-service/src/middleware/errorHandler.ts` | Global Express error handler |
+| `docker-download-service/src/types.ts` | All shared TypeScript interfaces (`DockerPayload`, `ResolvedImage`, `AuditSeverityCounts`, `ImageMetadata`, `DockerMetadata`) |
+| `docker-download-service/src/resolver.ts` | Validates image names (no shell metacharacters, ≤128 chars), deduplicates by `name:tag`, normalises tag (defaults to `latest`), returns `ResolvedImage[]` with platform filled in. No dependency graph — Docker has no transitive deps. |
+| `docker-download-service/src/downloader.ts` | Concurrently runs `docker pull --platform <platform> <image>:<tag>` for all images via `Promise.allSettled`. For `latest`-tagged images, runs `docker inspect` to get the repo digest (first 8 hex chars used as filename suffix). Runs `docker save` to produce `.tar` files. Runs `trivy image --format json` on each image for vulnerability scanning. Cleans up with `docker rmi`. Bundles all `.tar` files + `metadata.json` into `output/<id>.tgz` via `archiver`. |
 
 ## database source map
 
@@ -80,7 +102,7 @@ Volume mounts:
 
 **No single-letter variable names** — Use descriptive names throughout. Single-letter names (e.g. `m`, `p`, `k`) are banned as they are hard to read and debug. For example, use `match` for regex results, `pkg` for package objects, `key` for object keys.
 
-**Prettier for code formatting** — both `npm-download-service` and `telegram-bot` use Prettier (exact version, pinned in `devDependencies`) with a shared config: `trailingComma: "all"`, `printWidth: 120`, `useTabs: false`, `tabWidth: 2`. Run `npm run format` in either package to reformat all `src/**/*.{ts,js}` files. Config lives in `.prettierrc` at each package root.
+**Prettier for code formatting** — all three services (`npm-download-service`, `docker-download-service`, `telegram-bot`) use Prettier (exact version, pinned in `devDependencies`) with a shared config: `trailingComma: "all"`, `printWidth: 120`, `useTabs: false`, `tabWidth: 2`. Run `npm run format` in any package to reformat all `src/**/*.{ts,js}` files. Config lives in `.prettierrc` at each package root.
 
 **Import ordering** — imports are grouped in three sections, each separated by a blank line: (1) internet/npm packages (e.g. `express`, `telegraf`, `date-fns`), (2) Node.js built-in/library packages (e.g. `fs`, `path`, `os`, `child_process`), (3) project-local imports (e.g. `./app`, `../types`). No `import * as X` wildcard imports for internet or library packages — always use named imports (e.g. `import { readFileSync, writeFileSync } from "fs"`). In `downloader.ts` the Promise executor uses `(resolveZip, rejectZip)` to avoid shadowing the `resolve` named import from `path`.
 
@@ -98,7 +120,7 @@ Volume mounts:
 
 **`date-fns` for local-time timestamps** — all timestamps (`startedAt`, `completedAt`, `uploadedAt`, health check) use `formatISO()` from `date-fns`, which produces local time with UTC offset (e.g. `2026-03-21T10:00:00+08:00`) instead of UTC `Z` strings. The ID prefix uses `format(new Date(), 'yyyyMMdd-HHmm')` for a compact local-time stamp. `telegram-bot` also uses `date-fns` (`format()`) when displaying `registeredAt` timestamps to the admin in the approve-client flow.
 
-**`TZ=Asia/Singapore` in containers** — `npm-download-service` and `telegram-bot` both set `TZ: Asia/Singapore` via `environment:` in `docker-compose.yml`. Without this, Node.js inside the container uses UTC, making all `date-fns` local-time calls produce UTC timestamps and UTC-offset IDs (`+00:00`).
+**`TZ=Asia/Singapore` in containers** — all three services set `TZ: Asia/Singapore` via `environment:` in `docker-compose.yml`. Without this, Node.js inside the container uses UTC, making all `date-fns` local-time calls produce UTC timestamps and UTC-offset IDs (`+00:00`).
 
 **Schema-driven DB initialisation** — `database/schemas/*.json` are the single source of truth for collection structure. `database/init/01-init.js` reads all JSON files generically on first MongoDB startup; adding a new collection means adding one JSON file with no changes to the init script.
 
@@ -110,13 +132,27 @@ Volume mounts:
 
 **`/cancel` middleware ordering** — the cancel command is registered on the bot after `session()` but before `stage.middleware()`. This ensures it intercepts `/cancel` before any active scene's step handlers can consume the message. It reads `ctx.session.__scenes.current` (via the typed `Scenes.WizardSession` cast) to detect whether a scene is active.
 
-**Shared wizard helpers** — all shared helpers live in `commands/helpers.ts`. `parseAndValidatePackageJson(text)` parses a JSON string, asserts the result is a non-array object with at least one dep field, validates that all dep values are strings (prevents resolver crashes), and returns only the allowlisted fields (`name`, `version`, `dependencies`, `devDependencies`, `peerDependencies`) — stripping everything else before it reaches `/upload`. Returns `null` on any failure. `parseNpmUrl(text)` matches an npmjs.com package URL and returns `{ name, version }` — defaulting to `"latest"` when no `/v/<version>` segment is present. Query strings and fragments (e.g. `?activeTab=dependencies`) are stripped before matching so tab URLs copied directly from npmjs.com work. After matching, `name` is validated against npm naming rules (`^(?:@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*|[a-z0-9][a-z0-9._-]*)$`, ≤214 chars) and `version` against a safe character set (`^[a-zA-Z0-9][a-zA-Z0-9._+\-]*$`, ≤64 chars) — this rejects shell metacharacters at the earliest entry point. Returns `null` for non-matching or invalid input. `requireCallbackData(ctx, prefix, errorMsg)` validates a callback query, answers it, and returns the data string after the given prefix — or replies with `errorMsg` and returns `null`; used by all inline-keyboard steps in admin scenes. `formatClientName(client)` joins `firstName` and `lastName` filtering out blanks. `CALLBACK_PREFIXES` is a `const` object of all inline-keyboard callback data prefixes (`SELECT_CLIENT`, `CONFIRM_ACTION`, `SELECT_JOB`, `SELECT_OUTCOME`). `SECRET_PROMPT_STEP` is the shared first wizard step used by all admin-gated scenes — replies "Enter the admin secret:" and advances the wizard.
+**Service-specific parsers in `commands/parsers/`** — npm and docker input parsing live in separate files rather than `helpers.ts`. `parsers/npm.ts` exports `parseAndValidatePackageJson` and `parseNpmUrl`; `parsers/docker.ts` exports `parseDockerJson`, `parseDockerHubUrl`, and `validateDockerImageName`. `helpers.ts` retains only truly shared utilities (`BotContext`, `getText`, `requireText`, `checkSecret`, `requireCallbackData`, `formatClientName`, `CALLBACK_PREFIXES`, `SECRET_PROMPT_STEP`, `MAX_PACKAGE_JSON_BYTES`, `ALLOWED_MIME_TYPES`). When `python-download-service` is built, add `parsers/python.ts` following the same pattern.
 
-**Passive package detection** — `index.ts` registers a `bot.on('message')` handler (after all commands) that automatically processes messages as a `/request` without the user typing a command. It triggers when a registered+approved user sends any document, text starting with `{`, or an npmjs.com package URL. Before downloading a document, the handler checks `file_size` (>100 KB → silent return) and `mime_type`/file extension against `ALLOWED_MIME_TYPES` (`application/json`, `text/plain`, `text/json`, `application/octet-stream`, `.json`, `.txt`); unrecognised types are silently ignored. After downloading, body length is rechecked as defence-in-depth. Both document and text paths use `parseAndValidatePackageJson` and silently ignore invalid input. npm URL inputs are handled by `parseNpmUrl` and routed to `processNpmUrlRequest`. The upload+job+notify logic lives in `commands/request.ts`, shared with the wizard. The wizard applies the same size and MIME checks but replies with error messages instead of silently ignoring.
+**Shared wizard helpers** — `requireCallbackData(ctx, prefix, errorMsg)` validates a callback query, answers it, and returns the data string after the given prefix — or replies with `errorMsg` and returns `null`; used by all inline-keyboard steps in admin scenes. `formatClientName(client)` joins `firstName` and `lastName` filtering out blanks. `CALLBACK_PREFIXES` is a `const` object of all inline-keyboard callback data prefixes (`SELECT_CLIENT`, `CONFIRM_ACTION`, `SELECT_JOB`, `SELECT_OUTCOME`). `SECRET_PROMPT_STEP` is the shared first wizard step used by all admin-gated scenes — replies "Enter the admin secret:" and advances the wizard.
+
+**JSON detection order: npm before docker** — when a message contains a JSON text/file, the bot checks for npm dep fields first (`dependencies`, `devDependencies`, `peerDependencies`). Only if none are present does it check for the `images` key (docker). This prevents a `package.json` that happens to have a custom `images` field from being misrouted to the docker service. URL routing is separate: `npmjs.com` → npm, `hub.docker.com` → docker; these are mutually exclusive so order doesn't matter.
+
+**`serviceType` field in jobs** — the `Job` interface has an optional `serviceType?: "npm" | "docker"` field. It is optional (not required) so that existing DB documents without the field continue to be read correctly. New jobs always pass `serviceType`. `/notify_client` labels use `job.serviceType ?? "npm"` — legacy jobs without the field display as `[npm]`.
+
+**Passive package detection** — `index.ts` registers a `bot.on('message')` handler (after all commands) that automatically processes messages as a `/request` without the user typing a command. It triggers when a registered+approved user sends any document, text starting with `{`, an npmjs.com URL, or a hub.docker.com URL. Before downloading a document, the handler checks `file_size` (>100 KB → silent return) and `mime_type`/file extension against `ALLOWED_MIME_TYPES` (`application/json`, `text/plain`, `text/json`, `application/octet-stream`, `.json`, `.txt`); unrecognised types are silently ignored. After downloading, body length is rechecked as defence-in-depth. JSON input is tried as npm first, then docker (same detection order as the wizard). The upload+job+notify logic lives in `commands/request.ts` (`submitJob` helper), shared with the wizard. The wizard replies with error messages on bad input; the passive handler silently ignores it.
 
 **Three-pass discovery for uninstalled packages** — packages never placed in `node_modules` by `npm install` yet still needed for the offline bundle come in three categories. After `walkNodeModules`, `resolver.ts` runs three passes: (a) reads `package-lock.json` and adds every entry with `optional: true` that is not already in `seen` — catches platform-specific optional deps (e.g. `@esbuild/win32-x64`) that npm skips for non-matching OS/CPU; npm v11 still writes these to the lockfile with `optional: true`; no depth filter is applied since `seen` deduplicates. (b) iterates the snapshot of `results` collected so far, reads each installed package's `package.json`, collects entries in `peerDependencies` marked `optional: true` in `peerDependenciesMeta`, deduplicates by name, then resolves each version via `resolveVersionRange()` and adds if not in `seen` — catches optional peer deps like `@mui/material-pigment-css` and `esbuild` (declared by `@mui/material` and `vite` respectively) that npm v11 does **not** write to the lockfile at all. (c) **non-recursive**: iterates only packages added by pass (b), calls `npm view <name>@<version> optionalDependencies --json` for each, and adds their optional deps — catches platform packages like all 27 `@esbuild/*` variants whose parent (`esbuild`) was itself never installed by npm and therefore absent from node_modules and the lockfile; exact versions use `semver.valid()` directly, ranges fall back to `resolveVersionRange()`. Pass (c) deliberately does not feed its own outputs back in — native binary packages like `@esbuild/*` have no further `optionalDependencies`, so the chain terminates after at most two effective rounds.
 
 **`/help` lists only user-facing commands** — admin commands (`/subscribe`, `/unsubscribe`, `/approve_client`, `/notify_client`) are intentionally omitted from the `/help` reply to keep the interface clean for regular users.
+
+**`execFile` for `docker` and `trivy` in docker-download-service** — `downloader.ts` uses `execFileAsync = promisify(execFile)` for all `docker` and `trivy` invocations, for the same reason as npm: image names are user-controlled and `execFile` bypasses the shell entirely, preventing injection via metacharacters.
+
+**Docker image tarball naming** — `latest`-tagged images get a short digest suffix so repeated pulls of `latest` produce distinct filenames: `nginx-latest-a5de3e7a.tar`. All other tags use `<name>-<tag>.tar` (e.g. `nginx-1.25.tar`), since pinned tags are stable. Slashes in namespaced image names are replaced with dashes: `bitnami/postgresql:16` → `bitnami-postgresql-16.tar`.
+
+**Trivy for docker vulnerability scanning** — `docker-download-service` runs `trivy image --format json <image>:<tag>` after each pull, the same way npm-download-service runs `npm audit --json`. Trivy exits non-zero when vulnerabilities are found; catch the error and read `stdout` for the JSON report. Severity levels map to `{ critical, high, medium, low, unknown }` in `metadata.json`.
+
+**Docker daemon access via host socket** — `docker-download-service` requires the Docker daemon to run `docker pull`, `docker save`, etc. When running in a container, `/var/run/docker.sock` is bind-mounted from the host. This gives the container root-equivalent access to the host Docker daemon and is acceptable for a self-hosted internal tool. Docker-in-Docker (`--privileged`) is not used.
 
 ## Known gotchas
 
@@ -134,18 +170,27 @@ Volume mounts:
 
 - **`/notify_client` re-fetches job in step 4** — `ctx.wizard.state` stores only the `jobId` string, not the `clientId` ObjectId. ObjectIds lose their prototype through Telegraf's session serialisation and become plain objects. Re-fetching the job document by `jobId` in the final step is the correct pattern.
 
+- **`trivy` exits with code 1** when vulnerabilities are found. `stdout` is still valid JSON. Always catch the error and read `err.stdout`; do not treat a non-zero exit as a failure. Same pattern as `npm audit`.
+
+- **Docker socket unavailable locally** — `docker-download-service` requires a running Docker daemon. When developing locally without Docker Compose, ensure Docker Desktop or `dockerd` is running. Inside a container, the socket mount (`/var/run/docker.sock`) must be present — if it is missing, all `docker pull` calls will fail with `connect ENOENT`.
+
+- **`docker rmi` failure is silent** — after `docker save`, `downloader.ts` calls `docker rmi` to clean up. This call is intentionally fire-and-forget (`.catch(() => {})`). If it fails (e.g. the image was tagged elsewhere), the archive is unaffected; only host storage cleanup is skipped.
+
 ## TypeScript compilation
 
-After any change to a `.ts` file in either package, verify the affected package compiles cleanly:
+After any change to a `.ts` file in a package, verify the affected package compiles cleanly:
 
 ```bash
 cd npm-download-service && npx tsc --noEmit
+cd docker-download-service && npx tsc --noEmit
 cd telegram-bot && npx tsc --noEmit
 ```
 
 A clean run produces no output. Fix any errors before considering the task done.
 
-## Output structure (npm-download-service)
+## Output structure
+
+### npm-download-service
 
 Each `output/<id>.tgz` contains:
 
@@ -157,3 +202,16 @@ lodash-4.17.21.tgz
 ```
 
 `metadata.json` fields: `startedAt`, `completedAt`, `summary` (total/succeeded/failed), `audit` (severity counts + `highPackages`/`criticalPackages` as `{name, version}[]`), `packages` (succeeded), `failedPackages` (with error message).
+
+### docker-download-service
+
+Each `output/<id>.tgz` contains:
+
+```
+metadata.json
+nginx-latest-a5de3e7a.tar   ← "latest" tag + short digest
+redis-7.tar                 ← pinned tag, no digest
+bitnami-postgresql-16.tar
+```
+
+`metadata.json` fields: `startedAt`, `completedAt`, `summary` (total/succeeded/failed), `audit` (`{ critical, high, medium, low, unknown }` from Trivy), `packages` (succeeded, includes `digest` for `latest`-tagged images), `failedPackages` (with error message). Load images on the target machine with `docker load -i <filename>.tar`.

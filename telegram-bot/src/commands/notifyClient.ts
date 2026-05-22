@@ -20,9 +20,10 @@ interface NotifyState {
 }
 
 function jobButtonLabel(job: JobDocument, client: ClientDocument): string {
+  const serviceTag = `[${job.serviceType ?? "npm"}]`;
   const handle = client.username ? ` (@${client.username})` : "";
   const date = format(job.startedAt, "dd MMM yyyy HH:mm");
-  return `${job.jobId} — ${formatClientName(client)}${handle} [${date}]`;
+  return `${serviceTag} ${job.jobId} — ${formatClientName(client)}${handle} [${date}]`;
 }
 
 async function sendJobOutcomeToClient(
