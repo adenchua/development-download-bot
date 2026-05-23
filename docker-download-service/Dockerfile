@@ -11,8 +11,12 @@ RUN npm run build
 FROM node:24-alpine
 WORKDIR /app
 
-# Install Docker CLI (for docker pull / docker save / docker inspect / docker rmi)
-RUN apk add --no-cache docker-cli
+# Install Docker CLI and curl, then download the Copa binary for image hardening.
+ARG COPA_VERSION=0.14.1
+RUN apk add --no-cache docker-cli curl \
+    && ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
+    && curl -fsSL "https://github.com/project-copacetic/copacetic/releases/download/v${COPA_VERSION}/copa_${COPA_VERSION}_linux_${ARCH}.tar.gz" \
+       | tar -xz -C /usr/local/bin copa
 
 COPY package*.json ./
 RUN npm ci --omit=dev

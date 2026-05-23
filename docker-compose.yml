@@ -22,12 +22,14 @@ services:
     env_file: ./docker-download-service/.env
     environment:
       TZ: Asia/Singapore
+    ports:
+      - "0.0.0.0:${DOCKER_SERVER_PORT:-3001}:3001"
     volumes:
       - ./docker-download-service/input:/app/input
       - ./docker-download-service/output:/app/output
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -49,21 +51,21 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  telegram-bot:
-    build: ./telegram-bot
-    env_file: ./telegram-bot/.env
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      npm-download-service:
-        condition: service_healthy
-      docker-download-service:
-        condition: service_healthy
-    environment:
-      TZ: Asia/Singapore
-      NPM_DOWNLOAD_SERVICE_URL: http://npm-download-service:3000
-      DOCKER_DOWNLOAD_SERVICE_URL: http://docker-download-service:3000
-    restart: unless-stopped
+  # telegram-bot:
+  #   build: ./telegram-bot
+  #   env_file: ./telegram-bot/.env
+  #   depends_on:
+  #     mongodb:
+  #       condition: service_healthy
+  #     npm-download-service:
+  #       condition: service_healthy
+  #     docker-download-service:
+  #       condition: service_healthy
+  #   environment:
+  #     TZ: Asia/Singapore
+  #     NPM_DOWNLOAD_SERVICE_URL: http://npm-download-service:3000
+  #     DOCKER_DOWNLOAD_SERVICE_URL: http://docker-download-service:3001
+  #   restart: unless-stopped
 
   mongo-express:
     image: mongo-express:1

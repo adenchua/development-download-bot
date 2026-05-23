@@ -1,23 +1,22 @@
 import { promisify } from "util";
-import { execFile } from "child_process";
-import { createWriteStream, unlinkSync } from "fs";
+import { execFile, spawn } from "child_process";
+import { createWriteStream, mkdirSync, unlinkSync, writeFileSync } from "fs";
 import { join, resolve } from "path";
 
 import archiver from "archiver";
 import { formatISO } from "date-fns";
 
 import { ResolvedImage, AuditSeverityCounts, DockerMetadata, ImageMetadata } from "./types";
+import { logger } from "./logger";
 
 const execFileAsync = promisify(execFile);
 
 const TRIVY_IMAGE = `aquasec/trivy:${process.env.TRIVY_VERSION ?? "latest"}`;
-const COPA_IMAGE = `ghcr.io/project-copacetic/copacetic:${process.env.COPA_VERSION ?? "latest"}`;
+const COPA_TIMEOUT = process.env.COPA_TIMEOUT ?? "30m";
 
-// Named docker volume shared between the trivy pre-scan and copa: trivy writes
-// the JSON report into it via --output, copa reads it via -r. Our service
-// itself never touches the volume — the file only crosses container boundaries.
-const COPA_REPORT_VOLUME = "copa-reports";
-const COPA_REPORT_MOUNT = "/reports";
+// Copa runs as a local binary (installed in the Docker image). Reports are written
+// to this directory so Copa can read them directly — no named Docker volume needed.
+const COPA_REPORTS_DIR = "/tmp/copa-reports";
 
 // Naming: "latest" tag gets a short digest suffix; all other tags use tag only.
 // Slashes in image names are replaced with dashes (e.g. bitnami/nginx → bitnami-nginx).
@@ -69,12 +68,14 @@ interface TrivyResult {
 }
 
 // Runs trivy against a pulled image.
-// When reportFilename is given, the JSON report is written into the shared
-// copa-reports volume (so copa can consume it) and stdout is empty — counts
-// are returned as zero. When reportFilename is unset, trivy streams JSON to
-// stdout and counts are parsed for use in metadata.json.
-async function runTrivyScan(imageRef: string, reportFilename?: string): Promise<AuditSeverityCounts> {
+// When reportPath is given, this is a pre-scan for Copa: the JSON report is written
+// to the local path so Copa (running as a binary) can read it directly.
+// When reportPath is unset, this is the post-patch scan: counts are parsed from
+// stdout for use in metadata.json.
+async function runTrivyScan(imageRef: string, reportPath?: string): Promise<AuditSeverityCounts> {
   const counts: AuditSeverityCounts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
+
+  logger.log(`[trivy] ${reportPath ? "pre-scan" : "post-patch scan"}: ${imageRef}`);
 
   const dockerArgs: string[] = [
     "run",
@@ -83,32 +84,35 @@ async function runTrivyScan(imageRef: string, reportFilename?: string): Promise<
     "/var/run/docker.sock:/var/run/docker.sock",
     "-v",
     "trivy-cache:/root/.cache/trivy",
+    TRIVY_IMAGE,
+    "image",
+    "--format",
+    "json",
+    "--quiet",
+    "--cache-ttl",
+    "1h",
+    imageRef,
   ];
-  if (reportFilename) {
-    dockerArgs.push("-v", `${COPA_REPORT_VOLUME}:${COPA_REPORT_MOUNT}`);
-  }
-  dockerArgs.push(TRIVY_IMAGE, "image", "--format", "json", "--quiet", "--cache-ttl", "1h");
-  if (reportFilename) {
-    dockerArgs.push("--output", `${COPA_REPORT_MOUNT}/${reportFilename}`);
-  }
-  dockerArgs.push(imageRef);
 
   let stdout = "";
   try {
-    const result = await execFileAsync("docker", dockerArgs);
+    const result = await execFileAsync("docker", dockerArgs, { maxBuffer: 1024 * 1024 * 1024 });
     stdout = result.stdout;
   } catch (err: unknown) {
     // trivy exits non-zero when vulnerabilities are found — read stdout anyway
     if (err && typeof err === "object" && "stdout" in err) {
       stdout = (err as { stdout: string }).stdout;
     } else {
-      console.error(`[trivy] scan failed for ${imageRef}:`, err);
+      logger.error(`[trivy] scan failed for ${imageRef}:`, err);
       return counts;
     }
   }
 
-  // Pre-scan writes to the shared volume; the report is consumed by copa, not us.
-  if (reportFilename) return counts;
+  if (reportPath) {
+    mkdirSync(COPA_REPORTS_DIR, { recursive: true });
+    writeFileSync(reportPath, stdout);
+    return counts;
+  }
 
   try {
     const report = JSON.parse(stdout) as TrivyResult;
@@ -120,10 +124,45 @@ async function runTrivyScan(imageRef: string, reportFilename?: string): Promise<
       }
     }
   } catch {
-    console.error(`[trivy] failed to parse output for ${imageRef}`);
+    logger.error(`[trivy] failed to parse output for ${imageRef}:`, stdout.slice(0, 500));
   }
 
   return counts;
+}
+
+interface SpawnResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+// Spawns a process and streams its stdout/stderr line-by-line to console in real time.
+// Collects both streams so callers can inspect them after the process exits.
+function spawnAndLog(bin: string, args: string[], logPrefix: string): Promise<SpawnResult> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(bin, args);
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      stdout += text;
+      for (const line of text.split("\n").filter((line) => line.trim())) {
+        logger.log(`${logPrefix} ${line}`);
+      }
+    });
+
+    proc.stderr.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      stderr += text;
+      for (const line of text.split("\n").filter((line) => line.trim())) {
+        logger.log(`${logPrefix} ${line}`);
+      }
+    });
+
+    proc.on("error", reject);
+    proc.on("close", (code) => resolve({ stdout, stderr, exitCode: code ?? 1 }));
+  });
 }
 
 interface HardenResult {
@@ -144,41 +183,38 @@ function parseCopaPatchedCount(text: string): number | undefined {
 //   - success → returns hardened:true with patchedTag set
 //   - no patchable CVEs (copa errors with a recognisable message) → hardened:true, no patchedTag
 //   - any other failure → hardened:false with reason set
-async function runCopaPatch(imageRef: string, reportFilename: string, patchedTag: string): Promise<HardenResult> {
-  try {
-    const { stdout } = await execFileAsync("docker", [
-      "run",
-      "--rm",
-      "-v",
-      "/var/run/docker.sock:/var/run/docker.sock",
-      "-v",
-      `${COPA_REPORT_VOLUME}:${COPA_REPORT_MOUNT}`,
-      COPA_IMAGE,
-      "patch",
-      "-i",
-      imageRef,
-      "-r",
-      `${COPA_REPORT_MOUNT}/${reportFilename}`,
-      "-t",
-      patchedTag,
-    ]);
-    return {
-      hardened: true,
-      patchedTag,
-      patchedPackageCount: parseCopaPatchedCount(stdout),
-    };
-  } catch (err: unknown) {
-    const stderr =
-      err && typeof err === "object" && "stderr" in err ? String((err as { stderr: string }).stderr) : String(err);
+async function runCopaPatch(imageRef: string, reportPath: string, patchedTag: string): Promise<HardenResult> {
+  logger.log(`[copa] patching ${imageRef}`);
+  const result = await spawnAndLog(
+    "copa",
+    ["patch", "-i", imageRef, "-r", reportPath, "-t", patchedTag, "--timeout", COPA_TIMEOUT],
+    "[copa]",
+  );
 
+  if (result.exitCode !== 0) {
     // Copa exits non-zero when the report has no patchable vulnerabilities.
-    if (/no.{0,30}(patches|vulnerab|updat)/i.test(stderr)) {
+    if (/no.{0,30}(patches|vulnerab|updat)/i.test(result.stderr)) {
       return { hardened: true, patchedPackageCount: 0 };
     }
 
-    const firstLine = stderr.split("\n").find((line) => line.trim().length > 0) ?? "copa error";
-    return { hardened: false, hardenReason: firstLine.trim().slice(0, 200) };
+    const reason =
+      result.stderr
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .filter((line) => !/^Unable to find image/.test(line))
+        .filter((line) => !/^(Run|See) ['"]?docker/.test(line))
+        .join("; ")
+        .slice(0, 300) || "copa error";
+    logger.error(`[copa] hardening failed for ${imageRef}:`, result.stderr.trim());
+    return { hardened: false, hardenReason: reason };
   }
+
+  return {
+    hardened: true,
+    patchedTag,
+    patchedPackageCount: parseCopaPatchedCount(result.stdout),
+  };
 }
 
 interface PullResult {
@@ -220,18 +256,27 @@ async function pullAndSave(image: ResolvedImage, outputDir: string, jobId: strin
 
   // Harden via copa (best-effort). Windows images are skipped upfront — copa is linux-only.
   const safeName = image.name.replace(/\//g, "-");
-  const reportFilename = `${jobId}-${safeName}-${image.tag}.json`;
+  const reportPath = join(COPA_REPORTS_DIR, `${jobId}-${safeName}-${image.tag}.json`);
   const copaTag = `${image.name}:copa-${jobId}`;
 
   let hardenResult: HardenResult;
   if (image.platform.startsWith("windows/")) {
     hardenResult = { hardened: false, hardenReason: "windows images not supported by copa" };
   } else {
-    await runTrivyScan(workingRef, reportFilename);
-    hardenResult = await runCopaPatch(workingRef, reportFilename, copaTag);
+    await runTrivyScan(workingRef, reportPath);
+    hardenResult = await runCopaPatch(workingRef, reportPath, copaTag);
+    try { unlinkSync(reportPath); } catch { /* best-effort cleanup of temp trivy report */ }
     if (hardenResult.patchedTag) {
-      // Re-tag the patched image as workingRef so docker save / docker load preserve the user-facing tag.
-      await execFileAsync("docker", ["tag", hardenResult.patchedTag, workingRef]);
+      try {
+        // Re-tag the patched image as workingRef so docker save / docker load preserve the user-facing tag.
+        await execFileAsync("docker", ["tag", hardenResult.patchedTag, workingRef]);
+      } catch {
+        // Copa exited 0 but the patched tag is not in the Docker daemon image store
+        // (seen with copa 0.14.x — image may land in BuildKit containerd store instead).
+        // Fall back to the original unpatched image so the download still succeeds.
+        logger.error(`[copa] patched tag ${hardenResult.patchedTag} not found after copa exited 0 — saving unpatched image`);
+        hardenResult = { hardened: false, hardenReason: "copa exited 0 but output tag not found in Docker daemon" };
+      }
     }
   }
 
