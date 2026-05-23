@@ -36,6 +36,24 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  python-download-service:
+    build: ./python-download-service
+    env_file: ./python-download-service/.env
+    environment:
+      TZ: Asia/Singapore
+    ports:
+      - "0.0.0.0:${PYTHON_SERVER_PORT:-3002}:3002"
+    volumes:
+      - ./python-download-service/input:/app/input
+      - ./python-download-service/output:/app/output
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3002/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
   mongodb:
     image: mongo:8
     env_file: ./database/.env
@@ -61,10 +79,13 @@ services:
         condition: service_healthy
       docker-download-service:
         condition: service_healthy
+      python-download-service:
+        condition: service_healthy
     environment:
       TZ: Asia/Singapore
       NPM_DOWNLOAD_SERVICE_URL: http://npm-download-service:3000
       DOCKER_DOWNLOAD_SERVICE_URL: http://docker-download-service:3001
+      PYTHON_DOWNLOAD_SERVICE_URL: http://python-download-service:3002
     restart: unless-stopped
 
   mongo-express:
