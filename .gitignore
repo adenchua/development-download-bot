@@ -52,6 +52,10 @@ npm-download-service/output/
 docker-download-service/input/
 docker-download-service/output/
 
+# python-download-service I/O directories
+python-download-service/input/
+python-download-service/output/
+
 # macOS artifacts
 .DS_Store
 .AppleDouble

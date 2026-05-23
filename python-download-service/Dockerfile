@@ -12,10 +12,18 @@ FROM node:24-alpine
 WORKDIR /app
 
 RUN apk add --no-cache python3 py3-pip \
-    && pip install --no-cache-dir pip-audit --break-system-packages
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir pip-audit
+
+ENV PATH="/opt/venv/bin:$PATH"
 
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 RUN mkdir -p input output
+
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
+    && chown -R appuser:appgroup /app
+USER appuser
+
 CMD ["node", "dist/index.js"]

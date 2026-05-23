@@ -50,7 +50,7 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
     );
 
     logger.log("Installing dependencies to resolve full tree...");
-    await execAsync("npm install --ignore-scripts --no-audit --no-fund", { cwd: tmpDir });
+    await execAsync("npm install --ignore-scripts --no-audit --no-fund", { cwd: tmpDir, timeout: 600_000 });
 
     const seen = new Set<string>();
     const results: ResolvedPackage[] = [];
@@ -162,7 +162,7 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
           const { stdout } = await execFileAsync(
             "npm",
             ["view", `${pkg.name}@${pkg.version}`, "optionalDependencies", "--json"],
-            { maxBuffer: 10 * 1024 * 1024 },
+            { maxBuffer: 10 * 1024 * 1024, timeout: 30_000 },
           );
           if (!stdout.trim()) continue;
           const optDeps = JSON.parse(stdout) as Record<string, string>;
@@ -207,6 +207,7 @@ async function runAudit(cwd: string, resolvedPackages: ResolvedPackage[]): Promi
     const { stdout } = await execAsync("npm audit --json", {
       cwd,
       maxBuffer: 10 * 1024 * 1024,
+      timeout: 120_000,
     });
     rawJson = stdout;
   } catch (err: unknown) {
@@ -249,7 +250,7 @@ async function runAudit(cwd: string, resolvedPackages: ResolvedPackage[]): Promi
 
 export async function resolveVersionRange(packageName: string, versionRange: string): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync("npm", ["view", packageName, "versions", "--json"], { maxBuffer: 10 * 1024 * 1024 });
+    const { stdout } = await execFileAsync("npm", ["view", packageName, "versions", "--json"], { maxBuffer: 10 * 1024 * 1024, timeout: 30_000 });
     const versions: string[] = JSON.parse(stdout);
     return semver.maxSatisfying(versions, versionRange);
   } catch {

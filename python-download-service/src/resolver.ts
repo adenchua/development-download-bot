@@ -19,6 +19,10 @@ export const MAX_PACKAGES = 500;
 // PEP 508 package name: starts and ends with alphanumeric, allows ._- in the middle
 export const PYTHON_PACKAGE_NAME_REGEX = /^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/;
 
+// PEP 440 version specifier: allows digits, letters (pre-release labels), .  *  ,  =  >  <  !  ~  and spaces only.
+// Excludes newlines, semicolons, @, --, and other characters that pip interprets as options or extras.
+export const PYTHON_VERSION_SPEC_REGEX = /^[a-zA-Z0-9.*,=<>!~\s]+$/;
+
 export function validatePayload(payload: PythonPayload): string | null {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return "Request body must be a JSON object";
@@ -44,6 +48,9 @@ export function validatePayload(payload: PythonPayload): string | null {
       }
       if (typeof pkgVersion !== "string") {
         return `All values in "${field}" must be strings`;
+      }
+      if (pkgVersion !== "*" && pkgVersion !== "" && !PYTHON_VERSION_SPEC_REGEX.test(pkgVersion)) {
+        return `Invalid version spec in "${field}" for "${pkgName}": "${pkgVersion}"`;
       }
       totalPackages++;
     }

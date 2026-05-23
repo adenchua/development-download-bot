@@ -5,6 +5,7 @@ import { join, resolve } from "path";
 
 import archiver from "archiver";
 import { formatISO } from "date-fns";
+import pLimit from "p-limit";
 
 import { ResolvedImage, AuditSeverityCounts, DockerMetadata, ImageMetadata } from "./types";
 import { logger } from "./logger";
@@ -95,7 +96,7 @@ async function runTrivyScan(imageRef: string, reportPath?: string): Promise<Audi
 
   let stdout = "";
   try {
-    const result = await execFileAsync("docker", dockerArgs, { maxBuffer: 1024 * 1024 * 1024 });
+    const result = await execFileAsync("docker", dockerArgs, { maxBuffer: 1024 * 1024 * 1024, timeout: 600_000 });
     stdout = result.stdout;
   } catch (err: unknown) {
     // trivy exits non-zero when vulnerabilities are found — read stdout anyway
@@ -241,7 +242,7 @@ interface PullFailure {
 
 async function pullAndSave(image: ResolvedImage, outputDir: string, jobId: string): Promise<PullResult> {
   const originalRef = `${image.name}:${image.tag}`;
-  await execFileAsync("docker", ["pull", "--platform", image.platform, originalRef]);
+  await execFileAsync("docker", ["pull", "--platform", image.platform, originalRef], { timeout: 1_800_000 });
 
   // For "latest"-tagged images, try to resolve to the concrete version via the OCI label.
   // workingRef holds the canonical ref we'll save under (resolved version if available, else original).
@@ -305,7 +306,7 @@ async function pullAndSave(image: ResolvedImage, outputDir: string, jobId: strin
   const filename = tarballName(image.name, finalTag, shortDigest);
   const tarPath = join(outputDir, filename);
 
-  await execFileAsync("docker", ["save", workingRef, "-o", tarPath]);
+  await execFileAsync("docker", ["save", workingRef, "-o", tarPath], { timeout: 600_000 });
 
   // Clean up all tags we created or pulled.
   const refsToRemove: string[] = [originalRef];
@@ -349,7 +350,8 @@ export async function downloadAndZip(images: ResolvedImage[], jobId: string): Pr
   const TEMP_DIR = resolve("output");
   const startedAt = formatISO(new Date());
 
-  const results = await Promise.allSettled(images.map((image) => pullAndSave(image, TEMP_DIR, jobId)));
+  const limit = pLimit(4);
+  const results = await Promise.allSettled(images.map((image) => limit(() => pullAndSave(image, TEMP_DIR, jobId))));
 
   const succeeded: PullResult[] = [];
   const failed: PullFailure[] = [];
@@ -364,7 +366,9 @@ export async function downloadAndZip(images: ResolvedImage[], jobId: string): Pr
         status: "rejected",
         name: image.name,
         version: image.tag,
-        error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        error: (result.reason instanceof Error ? result.reason.message.split("\n")[0] : String(result.reason))
+          .replace(/\/[^\s,]+|[A-Z]:\\[^\s,]+/g, "<path>")
+          .slice(0, 200),
       });
     }
   }

@@ -1,9 +1,9 @@
 import archiver from "archiver";
 import { formatISO } from "date-fns";
+import pLimit from "p-limit";
 
 import {
   createWriteStream,
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -58,34 +58,41 @@ export async function downloadAndBundle(id: string, payload: PythonPayload): Pro
     const failedTargets: FailedTarget[] = [];
     let succeededTargets = 0;
 
+    const limit = pLimit(4);
     const targetResults = await Promise.allSettled(
-      targets.map(async (target) => {
-        const targetDir = join(tmpRoot, `${target.platform}-${target.pythonVersion}`);
-        mkdirSync(targetDir);
+      targets.map((target) =>
+        limit(async () => {
+          const targetDir = join(tmpRoot, `${target.platform}-${target.pythonVersion}`);
+          mkdirSync(targetDir);
 
-        const pythonMajorMinor = target.pythonVersion.replace(".", "");
-        const abiTag = `cp${pythonMajorMinor}`;
+          const pythonMajorMinor = target.pythonVersion.replace(".", "");
+          const abiTag = `cp${pythonMajorMinor}`;
 
-        await execFileAsync("pip3", [
-          "download",
-          "-r",
-          requirementsPath,
-          "--only-binary",
-          ":all:",
-          "--platform",
-          target.platform,
-          "--python-version",
-          target.pythonVersion,
-          "--implementation",
-          "cp",
-          "--abi",
-          abiTag,
-          "--dest",
-          targetDir,
-        ]);
+          await execFileAsync(
+            "pip3",
+            [
+              "download",
+              "-r",
+              requirementsPath,
+              "--only-binary",
+              ":all:",
+              "--platform",
+              target.platform,
+              "--python-version",
+              target.pythonVersion,
+              "--implementation",
+              "cp",
+              "--abi",
+              abiTag,
+              "--dest",
+              targetDir,
+            ],
+            { timeout: 300_000 },
+          );
 
-        return { target, targetDir };
-      }),
+          return { target, targetDir };
+        }),
+      ),
     );
 
     for (let index = 0; index < targetResults.length; index++) {
@@ -98,8 +105,9 @@ export async function downloadAndBundle(id: string, payload: PythonPayload): Pro
         succeededTargets++;
         logger.log(`  ✓ ${target.platform} / Python ${target.pythonVersion}`);
       } else {
-        const errorMessage =
+        const rawMessage =
           result.reason instanceof Error ? result.reason.message.split("\n")[0] : String(result.reason);
+        const errorMessage = rawMessage.replace(/\/[^\s,]+|[A-Z]:\\[^\s,]+/g, "<path>").slice(0, 200);
         failedTargets.push({ platform: target.platform, pythonVersion: target.pythonVersion, error: errorMessage });
         logger.error(`  ✗ ${target.platform} / Python ${target.pythonVersion} — ${errorMessage}`);
       }
@@ -133,9 +141,10 @@ export async function downloadAndBundle(id: string, payload: PythonPayload): Pro
 
 function mergeIntoDir(sourceDir: string, destDir: string): void {
   for (const filename of readdirSync(sourceDir)) {
-    const destPath = join(destDir, filename);
-    if (!existsSync(destPath)) {
-      renameSync(join(sourceDir, filename), destPath);
+    try {
+      renameSync(join(sourceDir, filename), join(destDir, filename));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
   }
 }
@@ -144,7 +153,7 @@ async function runPipAudit(requirementsPath: string): Promise<AuditSeverityCount
   const zeroCounts: AuditSeverityCounts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
 
   try {
-    const { stdout } = await execFileAsync("pip-audit", ["-r", requirementsPath, "--format", "json"]).catch(
+    const { stdout } = await execFileAsync("pip-audit", ["-r", requirementsPath, "--format", "json"], { timeout: 60_000 }).catch(
       (err: unknown) => {
         if (err instanceof Error && "stdout" in err) {
           return { stdout: (err as NodeJS.ErrnoException & { stdout: string }).stdout };

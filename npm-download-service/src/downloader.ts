@@ -1,5 +1,6 @@
 import archiver from "archiver";
 import { formatISO } from "date-fns";
+import pLimit from "p-limit";
 
 import { createWriteStream, mkdirSync, mkdtempSync, readdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
@@ -32,16 +33,20 @@ export async function downloadAndZip(packages: ResolvedPackage[], id: string, au
   const startedAt = formatISO(new Date());
 
   try {
+    const limit = pLimit(4);
     const packResults = await Promise.allSettled(
-      packages.map(async (pkg) => {
-        const ref = `${pkg.name}@${pkg.version}`;
-        await execFileAsync("npm", ["pack", ref, "--pack-destination", tmpDir], {
-          maxBuffer: 1024 * 1024 * 1024,
-        });
-        const tarball = tarballName(pkg.name, pkg.version);
-        logger.log(`  ✓ ${ref}`);
-        return { name: pkg.name, version: pkg.version, tarball };
-      }),
+      packages.map((pkg) =>
+        limit(async () => {
+          const ref = `${pkg.name}@${pkg.version}`;
+          await execFileAsync("npm", ["pack", ref, "--pack-destination", tmpDir], {
+            maxBuffer: 1024 * 1024 * 1024,
+            timeout: 300_000,
+          });
+          const tarball = tarballName(pkg.name, pkg.version);
+          logger.log(`  ✓ ${ref}`);
+          return { name: pkg.name, version: pkg.version, tarball };
+        }),
+      ),
     );
 
     for (let index = 0; index < packResults.length; index++) {
@@ -51,7 +56,8 @@ export async function downloadAndZip(packages: ResolvedPackage[], id: string, au
         downloaded.push(result.value);
         succeeded++;
       } else {
-        const message = result.reason instanceof Error ? result.reason.message.split("\n")[0] : String(result.reason);
+        const rawMessage = result.reason instanceof Error ? result.reason.message.split("\n")[0] : String(result.reason);
+        const message = rawMessage.replace(/\/[^\s,]+|[A-Z]:\\[^\s,]+/g, "<path>").slice(0, 200);
         logger.error(`  ✗ Failed: ${pkg.name}@${pkg.version} — ${message}`);
         failedPackages.push({ name: pkg.name, version: pkg.version, error: message });
         failed++;
