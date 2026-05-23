@@ -70,9 +70,8 @@ interface TrivyResult {
 // Runs trivy against a pulled image.
 // When reportPath is given, this is a pre-scan for Copa: the JSON report is written
 // to the local path so Copa (running as a binary) can read it directly.
-// When reportPath is unset, this is the post-patch scan: counts are parsed from
-// stdout for use in metadata.json.
-async function runTrivyScan(imageRef: string, reportPath?: string): Promise<AuditSeverityCounts> {
+// Returns null on any scan or parse failure — callers must run Copa when null is returned.
+async function runTrivyScan(imageRef: string, reportPath?: string): Promise<AuditSeverityCounts | null> {
   const counts: AuditSeverityCounts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
 
   logger.log(`[trivy] ${reportPath ? "pre-scan" : "post-patch scan"}: ${imageRef}`);
@@ -104,14 +103,13 @@ async function runTrivyScan(imageRef: string, reportPath?: string): Promise<Audi
       stdout = (err as { stdout: string }).stdout;
     } else {
       logger.error(`[trivy] scan failed for ${imageRef}:`, err);
-      return counts;
+      return null;
     }
   }
 
   if (reportPath) {
     mkdirSync(COPA_REPORTS_DIR, { recursive: true });
     writeFileSync(reportPath, stdout);
-    return counts;
   }
 
   try {
@@ -125,9 +123,14 @@ async function runTrivyScan(imageRef: string, reportPath?: string): Promise<Audi
     }
   } catch {
     logger.error(`[trivy] failed to parse output for ${imageRef}:`, stdout.slice(0, 500));
+    return null;
   }
 
   return counts;
+}
+
+function allZero(counts: AuditSeverityCounts): boolean {
+  return counts.critical === 0 && counts.high === 0 && counts.medium === 0 && counts.low === 0 && counts.unknown === 0;
 }
 
 interface SpawnResult {
@@ -259,24 +262,37 @@ async function pullAndSave(image: ResolvedImage, outputDir: string, jobId: strin
   const reportPath = join(COPA_REPORTS_DIR, `${jobId}-${safeName}-${image.tag}.json`);
   const copaTag = `${image.name}:copa-${jobId}`;
 
+  const zeroAudit: AuditSeverityCounts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
   let hardenResult: HardenResult;
+  let audit: AuditSeverityCounts;
+
   if (image.platform.startsWith("windows/")) {
     hardenResult = { hardened: false, hardenReason: "windows images not supported by copa" };
+    audit = (await runTrivyScan(workingRef)) ?? zeroAudit;
   } else {
-    await runTrivyScan(workingRef, reportPath);
-    hardenResult = await runCopaPatch(workingRef, reportPath, copaTag);
-    try { unlinkSync(reportPath); } catch { /* best-effort cleanup of temp trivy report */ }
-    if (hardenResult.patchedTag) {
-      try {
-        // Re-tag the patched image as workingRef so docker save / docker load preserve the user-facing tag.
-        await execFileAsync("docker", ["tag", hardenResult.patchedTag, workingRef]);
-      } catch {
-        // Copa exited 0 but the patched tag is not in the Docker daemon image store
-        // (seen with copa 0.14.x — image may land in BuildKit containerd store instead).
-        // Fall back to the original unpatched image so the download still succeeds.
-        logger.error(`[copa] patched tag ${hardenResult.patchedTag} not found after copa exited 0 — saving unpatched image`);
-        hardenResult = { hardened: false, hardenReason: "copa exited 0 but output tag not found in Docker daemon" };
+    const preScanCounts = await runTrivyScan(workingRef, reportPath);
+    if (preScanCounts !== null && allZero(preScanCounts)) {
+      // Confirmed clean — no CVEs to patch, skip Copa and post-scan entirely.
+      hardenResult = { hardened: true, patchedPackageCount: 0 };
+      audit = preScanCounts;
+      try { unlinkSync(reportPath); } catch { /* best-effort cleanup of temp trivy report */ }
+    } else {
+      hardenResult = await runCopaPatch(workingRef, reportPath, copaTag);
+      try { unlinkSync(reportPath); } catch { /* best-effort cleanup of temp trivy report */ }
+      if (hardenResult.patchedTag) {
+        try {
+          // Re-tag the patched image as workingRef so docker save / docker load preserve the user-facing tag.
+          await execFileAsync("docker", ["tag", hardenResult.patchedTag, workingRef]);
+        } catch {
+          // Copa exited 0 but the patched tag is not in the Docker daemon image store
+          // (seen with copa 0.14.x — image may land in BuildKit containerd store instead).
+          // Fall back to the original unpatched image so the download still succeeds.
+          logger.error(`[copa] patched tag ${hardenResult.patchedTag} not found after copa exited 0 — saving unpatched image`);
+          hardenResult = { hardened: false, hardenReason: "copa exited 0 but output tag not found in Docker daemon" };
+        }
       }
+      // Post-patch scan — this is the one recorded in metadata.json.audit.
+      audit = (await runTrivyScan(workingRef)) ?? zeroAudit;
     }
   }
 
@@ -285,9 +301,6 @@ async function pullAndSave(image: ResolvedImage, outputDir: string, jobId: strin
   const tarPath = join(outputDir, filename);
 
   await execFileAsync("docker", ["save", workingRef, "-o", tarPath]);
-
-  // Post-patch scan — this is the one recorded in metadata.json.audit.
-  const audit = await runTrivyScan(workingRef);
 
   // Clean up all tags we created or pulled.
   const refsToRemove: string[] = [originalRef];
