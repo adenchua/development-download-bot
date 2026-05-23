@@ -250,7 +250,10 @@ async function runAudit(cwd: string, resolvedPackages: ResolvedPackage[]): Promi
 
 export async function resolveVersionRange(packageName: string, versionRange: string): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync("npm", ["view", packageName, "versions", "--json"], { maxBuffer: 10 * 1024 * 1024, timeout: 30_000 });
+    const { stdout } = await execFileAsync("npm", ["view", packageName, "versions", "--json"], {
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 30_000,
+    });
     const versions: string[] = JSON.parse(stdout);
     return semver.maxSatisfying(versions, versionRange);
   } catch {

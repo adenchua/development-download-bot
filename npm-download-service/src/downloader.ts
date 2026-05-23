@@ -56,7 +56,8 @@ export async function downloadAndZip(packages: ResolvedPackage[], id: string, au
         downloaded.push(result.value);
         succeeded++;
       } else {
-        const rawMessage = result.reason instanceof Error ? result.reason.message.split("\n")[0] : String(result.reason);
+        const rawMessage =
+          result.reason instanceof Error ? result.reason.message.split("\n")[0] : String(result.reason);
         const message = rawMessage.replace(/\/[^\s,]+|[A-Z]:\\[^\s,]+/g, "<path>").slice(0, 200);
         logger.error(`  ✗ Failed: ${pkg.name}@${pkg.version} — ${message}`);
         failedPackages.push({ name: pkg.name, version: pkg.version, error: message });
