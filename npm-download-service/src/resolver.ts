@@ -104,21 +104,28 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
       }
     }
 
-    walkNodeModules(join(tmpDir, "node_modules"));
-
     const lockfilePath = join(tmpDir, "package-lock.json");
-    if (existsSync(lockfilePath)) {
+
+    function collectOptionalFromLockfile(): void {
+      if (!existsSync(lockfilePath)) return;
       const lockfile = JSON.parse(readFileSync(lockfilePath, "utf-8")) as PackageLock;
       for (const [modulePath, entry] of Object.entries(lockfile.packages ?? {})) {
         if (!entry.optional || !entry.version) continue;
-
-        const name = modulePath.replace(/^node_modules\//, "");
-        addIfNew(name, entry.version);
+        addIfNew(modulePath.replace(/^node_modules\//, ""), entry.version);
       }
     }
 
-    // npm v11 does not write optional peer deps (peerDependenciesMeta) to package-lock.json,
-    // so scan each installed package's package.json directly.
+    walkNodeModules(join(tmpDir, "node_modules"));
+    collectOptionalFromLockfile();
+
+    // Audit the user's actual dependency tree now, before we expand it with optional peers below,
+    // so the report reflects the real project rather than speculatively-added optional peers.
+    logger.log("Running vulnerability audit...");
+    const audit = await runAudit(tmpDir, results);
+
+    // Discover optional peer dependencies (peerDependenciesMeta.optional). npm does not install
+    // these, and npm v11 does not write them to package-lock.json, so scan each installed
+    // package.json directly (e.g. vite → esbuild, @types/node; @mui/material → @mui/material-pigment-css).
     const optionalPeerCandidates = new Map<string, string>();
     for (const pkg of [...results]) {
       const pkgDir = join(tmpDir, "node_modules", ...pkg.name.split("/"));
@@ -141,54 +148,40 @@ export async function resolveAllDependencies(packageJsonPath: string): Promise<R
       }
     }
 
-    const passBAdded: ResolvedPackage[] = [];
-    if (optionalPeerCandidates.size > 0) {
-      logger.log(`Resolving ${optionalPeerCandidates.size} optional peer dep(s)...`);
-      for (const [peerName, peerRange] of optionalPeerCandidates) {
-        const resolvedVersion = await resolveVersionRange(peerName, peerRange);
-        if (resolvedVersion) {
-          if (addIfNew(peerName, resolvedVersion)) {
-            passBAdded.push({ name: peerName, version: resolvedVersion });
-            logger.log(`  Added optional peer dep: ${peerName}@${resolvedVersion}`);
-          }
-        }
+    // Reinstall with the optional peers added so npm materialises each peer's FULL transitive
+    // closure — regular deps AND platform-specific optional deps. A standalone
+    // `npm view optionalDependencies` pass cannot do this: it misses regular dependencies like
+    // @types/node → undici-types, which then 404 on an offline install. Peers already in `merged`
+    // are skipped — the user's tree already resolved them, and re-adding a newer version would
+    // pollute the bundle with a version whose own deps were never fetched.
+    const peersToInstall: Record<string, string> = {};
+    for (const [peerName, peerRange] of optionalPeerCandidates) {
+      if (peerName in merged) continue;
+      const resolvedVersion = await resolveVersionRange(peerName, peerRange);
+      if (resolvedVersion) peersToInstall[peerName] = resolvedVersion;
+    }
+
+    const peerNames = Object.keys(peersToInstall);
+    if (peerNames.length > 0) {
+      logger.log(`Installing ${peerNames.length} optional peer dep(s) to capture their dependencies...`);
+      writeFileSync(
+        join(tmpDir, "package.json"),
+        JSON.stringify(
+          { name: "resolver-tmp", version: "1.0.0", dependencies: { ...merged, ...peersToInstall } },
+          null,
+          2,
+        ),
+      );
+      try {
+        await execAsync("npm install --ignore-scripts --no-audit --no-fund", { cwd: tmpDir, timeout: 600_000 });
+        walkNodeModules(join(tmpDir, "node_modules"));
+        collectOptionalFromLockfile();
+      } catch (err) {
+        const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+        logger.warn(`  Optional peer reinstall failed — bundle may omit optional peer deps: ${message}`);
       }
     }
 
-    // Pass (c): fetch optionalDependencies of packages added by pass (b).
-    // Not recursive — only processes pass (b) outputs. Catches platform-specific
-    // packages (e.g. @esbuild/*) whose parent (esbuild) was never installed by npm.
-    if (passBAdded.length > 0) {
-      logger.log(`Resolving optional deps of ${passBAdded.length} optional peer dep(s)...`);
-      for (const pkg of passBAdded) {
-        try {
-          const { stdout } = await execFileAsync(
-            "npm",
-            ["view", `${pkg.name}@${pkg.version}`, "optionalDependencies", "--json"],
-            { maxBuffer: 10 * 1024 * 1024, timeout: 30_000 },
-          );
-          if (!stdout.trim()) continue;
-          const optDeps = JSON.parse(stdout) as Record<string, string>;
-          for (const [depName, depVersion] of Object.entries(optDeps)) {
-            if (semver.valid(depVersion)) {
-              if (addIfNew(depName, depVersion)) {
-                logger.log(`  Added optional dep of ${pkg.name}: ${depName}@${depVersion}`);
-              }
-            } else {
-              const resolved = await resolveVersionRange(depName, depVersion);
-              if (resolved && addIfNew(depName, resolved)) {
-                logger.log(`  Added optional dep of ${pkg.name}: ${depName}@${resolved}`);
-              }
-            }
-          }
-        } catch {
-          // package has no optionalDependencies or npm view failed
-        }
-      }
-    }
-
-    logger.log("Running vulnerability audit...");
-    const audit = await runAudit(tmpDir, results);
     return { packages: results, audit };
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
