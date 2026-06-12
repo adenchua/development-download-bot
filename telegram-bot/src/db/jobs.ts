@@ -8,7 +8,7 @@ export interface Job {
   clientId: ObjectId;
   jobId: string;
   startedAt: Date;
-  serviceType?: "npm" | "docker" | "python";
+  serviceType?: "npm" | "python";
   status?: "success" | "failed";
   completedAt?: Date;
   completedBy?: number;

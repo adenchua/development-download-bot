@@ -21,7 +21,7 @@ interface NotifyState {
 }
 
 function jobButtonLabel(job: JobDocument, client: ClientDocument): string {
-  const serviceTagMap: Record<string, string> = { npm: "[npm]", docker: "[docker]", python: "[python]" };
+  const serviceTagMap: Record<string, string> = { npm: "[npm]", python: "[python]" };
   const serviceTag = serviceTagMap[job.serviceType ?? "npm"] ?? "[npm]";
   const handle = client.username ? ` (@${client.username})` : "";
   const date = format(job.startedAt, "dd MMM yyyy HH:mm");

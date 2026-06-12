@@ -13,13 +13,11 @@ import {
   REQUEST_SCENE_ID,
   processPackageJsonRequest,
   processNpmUrlRequest,
-  processDockerJsonRequest,
   processPythonUrlRequest,
   processPythonPayloadRequest,
 } from "./commands/request";
 import { BotContext, MAX_PACKAGE_JSON_BYTES, ALLOWED_MIME_TYPES } from "./commands/helpers";
 import { parseAndValidatePackageJson, parseNpmUrl } from "./commands/parsers/npm";
-import { parseDockerJson, parseDockerHubUrl } from "./commands/parsers/docker";
 import { parsePyPIUrl, parseRequirementsTxt, parsePyprojectToml } from "./commands/parsers/python";
 import { logger } from "./logger";
 
@@ -57,7 +55,7 @@ bot.help((ctx) =>
     "Available commands:\n" +
       "/start — Welcome message\n" +
       "/register — Register your account\n" +
-      "/request — Submit a package.json or docker JSON to download packages\n" +
+      "/request — Submit a package.json or Python requirements to download packages\n" +
       "/cancel — Cancel the current conversation\n" +
       "/help — Show this message",
   ),
@@ -89,9 +87,8 @@ bot.on("message", async (ctx) => {
   const isDocument = "document" in msg;
   const isJsonText = "text" in msg && msg.text.trimStart().startsWith("{");
   const npmUrlParsed = "text" in msg ? parseNpmUrl(msg.text) : null;
-  const dockerUrlParsed = "text" in msg && !npmUrlParsed ? parseDockerHubUrl(msg.text) : null;
-  const pypiUrlParsed = "text" in msg && !npmUrlParsed && !dockerUrlParsed ? parsePyPIUrl(msg.text) : null;
-  if (!isDocument && !isJsonText && !npmUrlParsed && !dockerUrlParsed && !pypiUrlParsed) return;
+  const pypiUrlParsed = "text" in msg && !npmUrlParsed ? parsePyPIUrl(msg.text) : null;
+  if (!isDocument && !isJsonText && !npmUrlParsed && !pypiUrlParsed) return;
 
   const client = await getClientByTelegramId(ctx.from.id);
   if (!client) {
@@ -105,11 +102,6 @@ bot.on("message", async (ctx) => {
 
   if (npmUrlParsed) {
     await processNpmUrlRequest(ctx, npmUrlParsed.name, npmUrlParsed.version);
-    return;
-  }
-
-  if (dockerUrlParsed) {
-    await processDockerJsonRequest(ctx, dockerUrlParsed);
     return;
   }
 
@@ -162,16 +154,9 @@ bot.on("message", async (ctx) => {
     return;
   }
 
-  // npm takes priority: dep fields beat images key
   const pkg = parseAndValidatePackageJson(rawText);
   if (pkg) {
     await processPackageJsonRequest(ctx, pkg);
-    return;
-  }
-
-  const dockerPayload = parseDockerJson(rawText);
-  if (dockerPayload) {
-    await processDockerJsonRequest(ctx, dockerPayload);
   }
 });
 
@@ -181,9 +166,6 @@ async function main() {
   }
   if (!process.env.NPM_DOWNLOAD_SERVICE_URL) {
     throw new Error("NPM_DOWNLOAD_SERVICE_URL is not set");
-  }
-  if (!process.env.DOCKER_DOWNLOAD_SERVICE_URL) {
-    throw new Error("DOCKER_DOWNLOAD_SERVICE_URL is not set");
   }
   if (!process.env.PYTHON_DOWNLOAD_SERVICE_URL) {
     throw new Error("PYTHON_DOWNLOAD_SERVICE_URL is not set");

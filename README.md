@@ -8,7 +8,6 @@ A self-hosted system for downloading packages offline and managing user access v
 | Service | Host port | Purpose |
 |---------|-----------|---------|
 | `npm-download-service` | 3000 | REST API — resolves transitive npm dependencies and packages them as `.tgz` archives |
-| `docker-download-service` | 3001 | REST API — pulls Docker images, hardens them with Copa, and packages them as `.tgz` archives |
 | `python-download-service` | 3002 | REST API — downloads Python wheels for specified platforms and Python versions, packages them as `.tgz` archives |
 | `telegram-bot` | — | Telegram bot — submit download requests and manage user access |
 | `mongodb` | 27017 (internal) | Persistent storage for registered users, subscribers, and job history |
@@ -27,7 +26,6 @@ A self-hosted system for downloading packages offline and managing user access v
 cp database/.env.template database/.env
 cp telegram-bot/.env.template telegram-bot/.env
 cp npm-download-service/.env.template npm-download-service/.env
-cp docker-download-service/.env.template docker-download-service/.env
 cp python-download-service/.env.template python-download-service/.env
 ```
 
@@ -37,10 +35,9 @@ cp python-download-service/.env.template python-download-service/.env
 | `database/.env` | `MONGO_INITDB_ROOT_USERNAME`, `MONGO_INITDB_ROOT_PASSWORD`, `ME_CONFIG_MONGODB_ADMINUSERNAME`, `ME_CONFIG_MONGODB_ADMINPASSWORD`, `ME_CONFIG_BASICAUTH_USERNAME`, `ME_CONFIG_BASICAUTH_PASSWORD` |
 | `telegram-bot/.env` | `TELEGRAM_BOT_TOKEN`, `MONGODB_URI` (e.g. `mongodb://<user>:<pass>@mongodb:27017`), `APPROVE_SECRET` (strong random value) |
 | `npm-download-service/.env` | `SERVER_PORT` (default: `3000`) |
-| `docker-download-service/.env` | `SERVER_PORT` (default: `3001`), `TRIVY_VERSION` (default: `latest`), `COPA_TIMEOUT` (default: `30m`) |
 | `python-download-service/.env` | `SERVER_PORT` (default: `3002`) |
 
-> `NPM_DOWNLOAD_SERVICE_URL`, `DOCKER_DOWNLOAD_SERVICE_URL`, and `PYTHON_DOWNLOAD_SERVICE_URL` are injected automatically by Docker Compose into the telegram-bot. No manual configuration needed.
+> `NPM_DOWNLOAD_SERVICE_URL` and `PYTHON_DOWNLOAD_SERVICE_URL` are injected automatically by Docker Compose into the telegram-bot. No manual configuration needed.
 
 **2. Uncomment the `telegram-bot` service in `docker-compose.yml`** (it is commented out by default).
 
@@ -68,7 +65,6 @@ docker compose down -v         # stop and delete named volumes
 ```bash
 docker compose logs -f telegram-bot
 docker compose logs -f npm-download-service
-docker compose logs -f docker-download-service
 docker compose logs -f python-download-service
 docker compose logs -f mongodb
 ```
@@ -84,8 +80,6 @@ Users interact entirely through Telegram. The bot auto-detects input type — no
 |-------|---------|
 | `package.json` file or pasted JSON with `dependencies` / `devDependencies` / `peerDependencies` | npm |
 | `npmjs.com/package/<name>` URL | npm |
-| `{ "images": [...] }` JSON | Docker |
-| `hub.docker.com/_/<image>` or `hub.docker.com/r/<org>/<name>` URL | Docker |
 | `requirements.txt` file | Python |
 | `pyproject.toml` file (Poetry format) | Python |
 | `pypi.org/project/<name>/` or `pypi.org/project/<name>/<version>/` URL | Python |
@@ -113,12 +107,6 @@ npm install --prefer-offline --cache ./cache <package-name>
 # or unpack tarballs into a local registry
 ```
 
-**Docker** — `output/<id>.tgz` contains `.tar` Docker image archives and `metadata.json`. Load on the target machine with:
-
-```bash
-docker load -i <image>.tar
-```
-
 **Python** — `output/<id>.tgz` contains `.whl` wheel files for all requested platforms and Python versions, plus `metadata.json`. Install offline with:
 
 ```bash
@@ -130,5 +118,4 @@ pip install --no-index --find-links . <package-name>
 Each download service exposes a Swagger UI:
 
 - npm: `http://localhost:3000/docs`
-- docker: `http://localhost:3001/docs`
 - python: `http://localhost:3002/docs`
